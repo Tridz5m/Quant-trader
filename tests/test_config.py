@@ -36,3 +36,63 @@ def test_env_credentials(tmp_path, monkeypatch):
     cfg = load_config(None)
     assert cfg.mt5.login == 12345 and cfg.mt5.password == "secret"
     assert cfg.to_dict()["mt5"]["password"] == "***"
+
+
+def test_set_config_value_keeps_comments_and_validates(tmp_path):
+    from quant_trader.config import set_config_value
+
+    p = tmp_path / "config.yaml"
+    p.write_text((ROOT / "config.example.yaml").read_text(encoding="utf-8").replace("\n", "\r\n"), encoding="utf-8", newline="")
+    set_config_value(p, "risk", "risk_per_trade_pct", 0.75)
+    text = p.read_text(encoding="utf-8")
+    line = next(l for l in text.splitlines() if "risk_per_trade_pct" in l)
+    assert line.startswith("  risk_per_trade_pct: 0.75") and "# % of equity" in line
+    assert "\r\n" in p.read_bytes().decode() and load_config(p).risk.risk_per_trade_pct == 0.75
+    before = p.read_bytes()
+    with pytest.raises(ConfigError):
+        set_config_value(p, "risk", "risk_per_trade_pct", 50.0)
+    assert p.read_bytes() == before  # invalid value: file untouched
+    set_config_value(p, "risk", "cooldown_minutes", 30)  # existing key elsewhere in the section
+    set_config_value(p, "mt5", "server", "Demo-Server")
+    cfg = load_config(p)
+    assert cfg.risk.cooldown_minutes == 30 and cfg.mt5.server == "Demo-Server"
+
+
+def test_set_config_value_adds_missing_section(tmp_path):
+    from quant_trader.config import set_config_value
+
+    p = tmp_path / "config.yaml"
+    p.write_text("dry_run: false\n", encoding="utf-8")
+    set_config_value(p, "risk", "risk_per_trade_pct", 1.5)
+    assert load_config(p).risk.risk_per_trade_pct == 1.5
+
+
+def test_untouched_old_config_is_upgraded_edited_one_is_not(tmp_path):
+    from quant_trader.paths import upgrade_untouched_config
+
+    # The config.example.yaml shipped with version 1.0 (0.5% risk).
+    old_text = (ROOT / "tests" / "data" / "config_v1.0.example.yaml").read_text(encoding="utf-8")
+    home = tmp_path / "untouched"
+    home.mkdir()
+    (home / "config.yaml").write_text(old_text.replace("\n", "\r\n"), encoding="utf-8", newline="")  # as on Windows
+    assert load_config(home / "config.yaml").risk.risk_per_trade_pct == 0.5
+    assert upgrade_untouched_config(home)
+    assert load_config(home / "config.yaml").risk.risk_per_trade_pct == 1.0
+    assert (home / "config.old.yaml").exists()
+    assert not upgrade_untouched_config(home)  # already current
+
+    edited = tmp_path / "edited"
+    edited.mkdir()
+    (edited / "config.yaml").write_text(old_text.replace("risk_per_trade_pct: 0.5", "risk_per_trade_pct: 0.4"), encoding="utf-8")
+    assert not upgrade_untouched_config(edited)
+    assert load_config(edited / "config.yaml").risk.risk_per_trade_pct == 0.4
+
+
+def test_candidate_geometry_validation(tmp_path):
+    p = tmp_path / "c.yaml"
+    p.write_text("strategy:\n  candidate_geometries:\n    - [2.0, 3.0, 0]\n")
+    with pytest.raises(ConfigError, match="candidate_geometries"):
+        load_config(p)
+    p.write_text("strategy:\n  candidate_geometries:\n    - [1.5, 2.25, 36]\n    - [3, 4.5, 96]\n")
+    cfg = load_config(p)
+    assert [g.horizon_bars for g in cfg.strategy.geometries()] == [36, 96]  # duplicate of base dropped

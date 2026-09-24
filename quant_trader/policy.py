@@ -123,9 +123,14 @@ def manage_position(
     bars_held: int,
     now: pd.Timestamp,
     cfg: StrategyConfig,
+    horizon_bars: int | None = None,
 ) -> ManageAction | None:
-    """Decide what to do with an open position at a bar close."""
-    if bars_held >= cfg.horizon_bars:
+    """Decide what to do with an open position at a bar close.
+
+    ``horizon_bars`` is the trade's own maximum holding time (it depends on
+    the geometry the model chose); defaults to the configured one.
+    """
+    if bars_held >= (horizon_bars or cfg.horizon_bars):
         return ManageAction("close", "time_exit")
     if weekend_close_due(now, cfg):
         return ManageAction("close", "weekend")

@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .config import StrategyConfig
+from .config import Geometry, StrategyConfig
 from .features import compute_atr
 
 LABEL_COLUMNS = ("long_win", "short_win", "long_r", "short_r", "long_exit", "short_exit")
@@ -100,7 +100,9 @@ def triple_barrier(
     }
 
 
-def make_labels(bars: pd.DataFrame, point: float, cfg: StrategyConfig) -> pd.DataFrame:
+def make_labels(bars: pd.DataFrame, point: float, cfg: StrategyConfig, geometry: Geometry | None = None) -> pd.DataFrame:
+    """Labels for ``geometry`` (default: the configured base stop/target/horizon)."""
+    g = geometry or cfg.base_geometry
     a = compute_atr(bars, cfg.atr_period).to_numpy(dtype=float)
     out = triple_barrier(
         bars["open"].to_numpy(dtype=float),
@@ -109,9 +111,9 @@ def make_labels(bars: pd.DataFrame, point: float, cfg: StrategyConfig) -> pd.Dat
         bars["close"].to_numpy(dtype=float),
         a,
         bars["spread"].to_numpy(dtype=float) * point,
-        cfg.sl_atr_mult,
-        cfg.tp_atr_mult,
-        cfg.horizon_bars,
+        g.sl_atr_mult,
+        g.tp_atr_mult,
+        g.horizon_bars,
         cfg.slippage,
     )
     return pd.DataFrame(out, index=bars.index)

@@ -79,16 +79,8 @@ def cmd_status(cfg: BotConfig, args) -> int:
 
 
 def cmd_download(cfg: BotConfig, args) -> int:
-    broker = services.mt5_broker(cfg)
-    broker.connect()
-    try:
-        bars = broker.rates(args.bars)
-    finally:
-        broker.shutdown()
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    bars.to_csv(out)
-    print(f"Saved {len(bars)} bars ({bars.index[0]} -> {bars.index[-1]}) to {out}")
+    out, n = services.export_history(cfg, Path(args.out), args.bars)
+    print(f"Saved {n} bars to {out}")
     return 0
 
 
@@ -98,7 +90,7 @@ def cmd_backtest(cfg: BotConfig, args) -> int:
 
     source = "csv" if args.csv else "synthetic" if args.synthetic else "mt5"
     try:
-        bars, spec = services.load_backtest_bars(cfg, source, args.csv, args.bars, args.seed)
+        bars, spec, margin_rate = services.load_backtest_bars(cfg, source, args.csv, args.bars, args.seed)
     except (OSError, ValueError) as exc:
         print(f"Could not load the data: {exc}", file=sys.stderr)
         return 1
@@ -107,12 +99,12 @@ def cmd_backtest(cfg: BotConfig, args) -> int:
     print(f"Backtesting {len(bars)} bars {bars.index[0]} -> {bars.index[-1]} "
           f"(retrain every {args.retrain_days} days)...")
     try:
-        res = services.backtest(cfg, bars, spec, args.retrain_days, args.equity, args.commission)
+        res = services.backtest(cfg, bars, spec, args.retrain_days, args.equity, args.commission, margin_rate)
     except InsufficientDataError as exc:
         print(f"\nNot enough history for a walk-forward backtest: {exc}.\n{services.MORE_HISTORY_HELP}", file=sys.stderr)
         return 1
     print(format_stats(res.stats))
-    out = services.save_backtest(res, Path(args.out))
+    out = services.save_backtest(res, Path(args.out), bars if source == "mt5" else None)
     print(f"\nTrades, equity curve and model history written to {out}/")
     return 0
 

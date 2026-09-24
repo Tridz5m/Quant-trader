@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
 from pathlib import Path
+
+# config.example.yaml files shipped by earlier versions (sha256, LF line endings).
+# A config.yaml identical to one of these was never edited by the user.
+SHIPPED_DEFAULT_CONFIGS = {
+    "96f556226938c37452302337dae696057b5a2b67cdd2982cb2aa21a4033bfef9",  # 1.0: 0.5% risk per trade
+}
 
 
 def is_frozen() -> bool:
@@ -58,3 +65,24 @@ def ensure_config(home: Path) -> Path:
             home.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(example, path)
     return path
+
+
+def _content_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def upgrade_untouched_config(home: Path) -> bool:
+    """Replace a never-edited config.yaml from an older version with the new defaults.
+
+    The previous file is kept as config.old.yaml. Edited files are left alone.
+    """
+    path = home / "config.yaml"
+    example = bundled_example_config()
+    if not path.exists() or not example.exists():
+        return False
+    current = _content_hash(path)
+    if current not in SHIPPED_DEFAULT_CONFIGS or current == _content_hash(example):
+        return False
+    shutil.copyfile(path, home / "config.old.yaml")
+    shutil.copyfile(example, path)
+    return True

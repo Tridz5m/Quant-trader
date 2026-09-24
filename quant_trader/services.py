@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from .backtest import BacktestResult, run_backtest
-from .broker.base import SymbolSpec, default_gold_spec
+from .broker.base import LONG, SymbolSpec, default_gold_spec
 from .config import BotConfig
 from .features import WARMUP_BARS, prepare_bars
 from .journal import Journal
@@ -33,7 +33,8 @@ def mt5_broker(cfg: BotConfig):
 
 
 def training_bars_needed(cfg: BotConfig) -> int:
-    return cfg.learning.train_bars + WARMUP_BARS + cfg.strategy.horizon_bars + 100
+    longest = max(g.horizon_bars for g in cfg.strategy.geometries())
+    return cfg.learning.train_bars + WARMUP_BARS + longest + 100
 
 
 def train_from_mt5(cfg: BotConfig) -> TrainedModel | None:
@@ -71,15 +72,30 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     return out[keep]
 
 
+def broker_margin_rate(broker) -> float | None:
+    """The broker's margin per lot per 1.0 of price (contract size / leverage)."""
+    try:
+        price = broker.tick().ask
+        margin = broker.margin_required(LONG, 1.0, price)
+    except Exception:
+        return None
+    return margin / price if margin and price > 0 else None
+
+
 def load_backtest_bars(
     cfg: BotConfig,
     source: str = "mt5",
     csv_path: str | Path | None = None,
     n_bars: int | None = None,
     seed: int = 7,
-) -> tuple[pd.DataFrame, SymbolSpec]:
-    """Bars for a backtest from ``source``: "mt5", "csv" or "synthetic"."""
+) -> tuple[pd.DataFrame, SymbolSpec, float | None]:
+    """Bars for a backtest from ``source``: "mt5", "csv" or "synthetic".
+
+    Returns the bars, the symbol spec and, for MT5, the broker's margin rate
+    so the backtest sizes positions exactly like the live account.
+    """
     spec = default_gold_spec()
+    margin_rate = None
     if source == "csv":
         raw = load_csv(csv_path)
     elif source == "synthetic":
@@ -91,6 +107,7 @@ def load_backtest_bars(
         broker.connect()
         try:
             spec = broker.symbol_spec()
+            margin_rate = broker_margin_rate(broker)
             raw = broker.rates(n_bars or 100_000)
         finally:
             broker.shutdown()
@@ -98,7 +115,20 @@ def load_backtest_bars(
         raise ValueError(f"unknown data source {source!r}")
     if n_bars:
         raw = raw.iloc[-n_bars:]
-    return prepare_bars(raw, cfg.symbol.default_spread / spec.point), spec
+    return prepare_bars(raw, cfg.symbol.default_spread / spec.point), spec, margin_rate
+
+
+def export_history(cfg: BotConfig, out_path: Path, n_bars: int = 100_000) -> tuple[Path, int]:
+    """Save the broker's XAUUSD M5 history to CSV (for backtests or analysis)."""
+    broker = mt5_broker(cfg)
+    broker.connect()
+    try:
+        bars = broker.rates(n_bars)
+    finally:
+        broker.shutdown()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bars.to_csv(out_path)
+    return out_path, len(bars)
 
 
 def backtest(
@@ -108,6 +138,7 @@ def backtest(
     retrain_days: float = 5.0,
     equity: float = 10_000.0,
     commission: float = 0.0,
+    margin_rate: float | None = None,
 ) -> BacktestResult:
     return run_backtest(
         bars,
@@ -116,11 +147,15 @@ def backtest(
         retrain_every_bars=max(1, int(retrain_days * BARS_PER_DAY)),
         start_equity=equity,
         commission_per_lot=commission,
+        margin_rate=margin_rate,
     )
 
 
-def save_backtest(res: BacktestResult, out_dir: Path) -> Path:
+def save_backtest(res: BacktestResult, out_dir: Path, bars: pd.DataFrame | None = None) -> Path:
+    """Write trades, equity, model history and (optionally) the price bars."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    if bars is not None:
+        bars.to_csv(out_dir / "bars.csv")
     trades = res.trades
     if len(trades):
         trades = trades.round({"entry": 3, "exit": 3, "sl_initial": 3, "tp": 3, "profit": 2, "r_multiple": 3, "p": 3})

@@ -34,37 +34,54 @@ class BacktestResult:
     models: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class Signals:
+    """Out-of-sample model output and trade geometry for every bar."""
+
+    p_long: np.ndarray
+    p_short: np.ndarray
+    thr_long: np.ndarray
+    thr_short: np.ndarray
+    sl_mult: np.ndarray
+    tp_mult: np.ndarray
+    horizon: np.ndarray
+    history: list[dict]
+
+
 def walk_forward_start(cfg: BotConfig) -> int:
     """First bar that can be traded out-of-sample."""
-    return WARMUP_BARS + cfg.learning.min_train_bars + cfg.strategy.horizon_bars
+    longest = max(g.horizon_bars for g in cfg.strategy.geometries())
+    return WARMUP_BARS + cfg.learning.min_train_bars + longest
 
 
-def walk_forward_signals(
-    bars: pd.DataFrame,
-    cfg: BotConfig,
-    point: float,
-    retrain_every_bars: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict]]:
-    """Out-of-sample probabilities and thresholds for every bar."""
+def walk_forward_signals(bars: pd.DataFrame, cfg: BotConfig, point: float, retrain_every_bars: int) -> Signals:
+    """Retrain every ``retrain_every_bars`` using only data available at that time."""
     lc, sc = cfg.learning, cfg.strategy
     feats = build_features(bars, point, sc.atr_period, sc.timeframe_minutes)
-    labels = make_labels(bars, point, sc)
+    geos = sc.geometries()
+    labels = {g: make_labels(bars, point, sc, g) for g in geos}
     n = len(bars)
-    H = sc.horizon_bars
+    H = max(g.horizon_bars for g in geos)
     start = walk_forward_start(cfg)
     if start >= n:
         raise InsufficientDataError(f"need more than {start} bars for a walk-forward backtest, got {n}")
 
-    p_long = np.full(n, np.nan)
-    p_short = np.full(n, np.nan)
-    thr_long = np.full(n, np.inf)
-    thr_short = np.full(n, np.inf)
+    sig = Signals(
+        p_long=np.full(n, np.nan),
+        p_short=np.full(n, np.nan),
+        thr_long=np.full(n, np.inf),
+        thr_short=np.full(n, np.inf),
+        sl_mult=np.full(n, sc.sl_atr_mult, dtype=float),
+        tp_mult=np.full(n, sc.tp_atr_mult, dtype=float),
+        horizon=np.full(n, sc.horizon_bars, dtype=int),
+        history=[],
+    )
     champion: TrainedModel | None = None
-    history: list[dict] = []
     for s in range(start, n, retrain_every_bars):
         hi = s - H  # labels of rows < hi only use bars before s
         lo = max(WARMUP_BARS, hi - lc.train_bars)
-        X, L = feats.iloc[lo:hi], labels.iloc[lo:hi]
+        X = feats.iloc[lo:hi]
+        L = {g: lab.iloc[lo:hi] for g, lab in labels.items()}
         try:
             challenger = train_model(X, L, sc, lc, version=str(bars.index[s]))
         except InsufficientDataError as exc:
@@ -72,22 +89,29 @@ def walk_forward_signals(
             continue
         champion, why = choose_champion(champion, challenger, X, L, sc, lc)
         e = min(s + retrain_every_bars, n)
-        if champion is not None and champion.tradeable:
+        trading = bool(champion is not None and champion.tradeable)
+        if trading:
             pl, ps = champion.predict(feats.iloc[s:e])
-            p_long[s:e], p_short[s:e] = pl, ps
-            thr_long[s:e], thr_short[s:e] = champion.thresholds()
-        history.append(
+            sig.p_long[s:e], sig.p_short[s:e] = pl, ps
+            sig.thr_long[s:e], sig.thr_short[s:e] = champion.thresholds()
+            g = champion.geometry or sc.base_geometry
+            sig.sl_mult[s:e], sig.tp_mult[s:e], sig.horizon[s:e] = g.sl_atr_mult, g.tp_atr_mult, g.horizon_bars
+        m = challenger.metrics
+        sig.history.append(
             {
                 "time": bars.index[s],
                 "challenger_passed": challenger.passed,
-                "val_trades": challenger.metrics["trades"],
-                "val_expectancy_r": challenger.metrics["expectancy_r"],
+                "challenger_geometry": m.get("geometry"),
+                "tune_expectancy_r": m.get("tune_expectancy_r"),
+                "val_trades": m["trades"],
+                "val_expectancy_r": m["expectancy_r"],
                 "decision": why,
-                "trading": bool(champion is not None and champion.tradeable),
+                "trading": trading,
+                "trading_geometry": champion.geometry.label if trading and champion.geometry else None,
             }
         )
         log.info("[%s] %s | %s", bars.index[s], challenger.summary(), why)
-    return p_long, p_short, thr_long, thr_short, history
+    return sig
 
 
 def simulate(
@@ -100,10 +124,21 @@ def simulate(
     spec: SymbolSpec,
     start_equity: float = 10_000.0,
     commission_per_lot: float = 0.0,
-    leverage: float = 100.0,
+    margin_rate: float | None = None,
+    sl_mult: np.ndarray | None = None,
+    tp_mult: np.ndarray | None = None,
+    horizon: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Bar-by-bar trade simulation mirroring the live bot."""
+    """Bar-by-bar trade simulation mirroring the live bot.
+
+    ``margin_rate`` is the margin per lot per 1.0 of price (the broker's
+    contract size / leverage); by default 1:100 leverage is assumed.
+    ``sl_mult``/``tp_mult``/``horizon`` give each bar's trade geometry
+    (default: the configured base geometry).
+    """
     sc = cfg.strategy
+    if margin_rate is None:
+        margin_rate = spec.contract_size / 100.0
     rm = RiskManager(cfg.risk, quiet=True)
     state = RiskState()
     o = bars["open"].to_numpy(float)
@@ -144,6 +179,7 @@ def simulate(
                 "r_multiple": r,
                 "reason": reason,
                 "p": pos["p"],
+                "geometry": pos["geo"],
             }
         )
         pos = None
@@ -163,7 +199,10 @@ def simulate(
         rm.update_equity(state, now, balance + floating)
 
         if pos is not None:
-            act = manage_position(pos["dir"], pos["entry"], pos["sl"], pos["risk"], bid, ask, atr[i], i - pos["i"], now, sc)
+            act = manage_position(
+                pos["dir"], pos["entry"], pos["sl"], pos["risk"], bid, ask, atr[i], i - pos["i"], now, sc,
+                horizon_bars=pos["horizon"],
+            )
             if act is not None:
                 if act.kind == "close":
                     close(i, bid if pos["dir"] == LONG else ask, act.reason, now)
@@ -177,18 +216,21 @@ def simulate(
             if d != 0 and entry_block_reason(now, sp[i], atr[i], h[i] - l[i], sc) is None:
                 ok, _ = rm.can_open(state, now, 0)
                 if ok:
+                    slm = float(sl_mult[i]) if sl_mult is not None else sc.sl_atr_mult
+                    tpm = float(tp_mult[i]) if tp_mult is not None else sc.tp_atr_mult
+                    hz = int(horizon[i]) if horizon is not None else sc.horizon_bars
                     entry = ask + sc.slippage if d == LONG else bid - sc.slippage
-                    sl_dist = sc.sl_atr_mult * atr[i]
+                    sl_dist = slm * atr[i]
                     volume, _ = rm.position_size(eq, sl_dist, spec, mult)
-                    margin = volume * spec.contract_size * entry / leverage
-                    volume = rm.cap_by_margin(volume, margin, eq, spec)
+                    volume = rm.cap_by_margin(volume, volume * margin_rate * entry, eq, spec)
                     if volume > 0:
                         sl = entry - d * sl_dist
-                        tp = entry + d * sc.tp_atr_mult * atr[i]
+                        tp = entry + d * tpm * atr[i]
                         pos = {
                             "i": i, "dir": d, "entry": entry, "sl": sl, "sl0": sl, "tp": tp,
                             "volume": volume, "risk": sl_dist, "risk_money": volume * sl_dist * vpu,
                             "entry_time": now, "p": p_long[i] if d == LONG else p_short[i],
+                            "horizon": hz, "geo": f"{slm:g}/{tpm:g}/{hz}",
                         }
                         rm.register_entry(state)
 
@@ -235,6 +277,8 @@ def compute_stats(trades: pd.DataFrame, equity: pd.Series, start_equity: float) 
                 "exit_reasons": trades["reason"].value_counts().to_dict(),
             }
         )
+        if "geometry" in trades:
+            stats["geometries"] = trades["geometry"].value_counts().to_dict()
     return stats
 
 
@@ -245,9 +289,14 @@ def run_backtest(
     retrain_every_bars: int = 1440,
     start_equity: float = 10_000.0,
     commission_per_lot: float = 0.0,
+    margin_rate: float | None = None,
 ) -> BacktestResult:
-    pl, ps, tl, ts, history = walk_forward_signals(bars, cfg, spec.point, retrain_every_bars)
-    trades, equity = simulate(bars, pl, ps, tl, ts, cfg, spec, start_equity, commission_per_lot)
+    sig = walk_forward_signals(bars, cfg, spec.point, retrain_every_bars)
+    history = sig.history
+    trades, equity = simulate(
+        bars, sig.p_long, sig.p_short, sig.thr_long, sig.thr_short, cfg, spec, start_equity, commission_per_lot,
+        margin_rate=margin_rate, sl_mult=sig.sl_mult, tp_mult=sig.tp_mult, horizon=sig.horizon,
+    )
     # Stats cover the whole out-of-sample period, including stretches where
     # the learner found no edge and stayed flat.
     start_i = walk_forward_start(cfg)
@@ -278,6 +327,7 @@ def format_stats(stats: dict) -> str:
         ("shorts", "Shorts", "{}"),
         ("avg_bars_held", "Avg bars held", "{:.1f}"),
         ("exit_reasons", "Exit reasons", "{}"),
+        ("geometries", "Stop/target/bars", "{}"),
     ]
     for key, label, fmt in order:
         if key in stats:

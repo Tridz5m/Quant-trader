@@ -27,3 +27,20 @@ def test_walk_forward_backtest_runs(trend_bars, cfg):
     assert res.models
     assert res.stats["trades"] > 0
     assert np.isfinite(res.equity).all()
+
+
+def test_simulate_uses_per_bar_geometry_and_broker_margin(noise_bars, cfg):
+    n = len(noise_bars)
+    p = np.full(n, 0.9)
+    thr = np.full(n, 0.5)
+    spec = default_gold_spec()
+    sl = np.full(n, 4.0)
+    tp = np.full(n, 6.0)
+    hz = np.full(n, 12)
+    trades, _ = simulate(noise_bars, p, np.zeros(n), thr, thr, cfg, spec, 10_000, sl_mult=sl, tp_mult=tp, horizon=hz)
+    assert set(trades["geometry"]) == {"4/6/12"}
+    assert trades["bars_held"].max() <= 12
+    # A broker needing 10x more margin per lot caps the position size.
+    cheap, _ = simulate(noise_bars, p, np.zeros(n), thr, thr, cfg, spec, 10_000, margin_rate=0.01)
+    dear, _ = simulate(noise_bars, p, np.zeros(n), thr, thr, cfg, spec, 10_000, margin_rate=10.0)
+    assert dear["volume"].iloc[0] < cheap["volume"].iloc[0]

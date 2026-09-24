@@ -26,6 +26,7 @@ def _fast_config(base_dir: str):
     cfg.learning.max_iter = 60
     cfg.learning.min_samples_leaf = 100
     cfg.schedule.history_bars = 6000
+    cfg.news.enabled = False
     return cfg
 
 
@@ -82,9 +83,9 @@ def run_selftest(log_path: Path, check_gui: bool = True) -> int:
         cfg = _fast_config(tmp.name)
         bars = prepare_bars(synthetic_gold_bars(15_000, seed=5, trend_strength=0.45), 25)
         feats, labels = build_dataset(bars, cfg, 0.01)
-        assert len(feats) == len(labels) > 10_000
+        assert len(feats) > 10_000 and all(len(L) == len(feats) for L in labels.values())
         state.update(cfg=cfg, bars=bars, feats=feats, labels=labels)
-        return f"{feats.shape[1]} features x {len(feats)} bars"
+        return f"{feats.shape[1]} features x {len(feats)} bars, {len(labels)} stop/target geometries"
 
     def train_and_reload():
         import numpy as np

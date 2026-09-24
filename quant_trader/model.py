@@ -1,10 +1,12 @@
 """Signal model: two gradient-boosted classifiers (long and short).
 
 Each classifier estimates P(target is hit before the stop) for its side.
-Training is walk-forward: fit on older data, then pick the confidence
-threshold that maximises risk-adjusted expectancy on newer, unseen data
-(with a purge gap so labels cannot leak). A model only trades if it passes
-out-of-sample quality gates; otherwise the bot stays flat.
+Training is walk-forward: fit on older data, then use newer, unseen data in
+two separate steps. The *tune* segment picks the confidence thresholds and
+the stop/target geometry; the later *test* segment, which influenced none
+of those choices, decides whether the model may trade. Purge gaps keep
+labels from leaking across the boundaries. A model that fails the gates on
+the test segment stays flat.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
 
-from .config import LearningConfig, StrategyConfig
+from .config import Geometry, LearningConfig, StrategyConfig
 from .features import FEATURE_VERSION
 from .policy import LONG, SHORT, decide_vec, simulate_policy, trade_stats
 
@@ -33,13 +35,18 @@ class InsufficientDataError(RuntimeError):
     pass
 
 
+MODEL_FORMAT = 2
+
+
 def strategy_signature(scfg: StrategyConfig) -> dict[str, Any]:
-    """Parameters the labels depend on. Changing any of them invalidates a model."""
+    """Settings a model depends on. Changing any of them invalidates it.
+
+    The stop/target geometry is stored per model instead (see
+    ``TrainedModel.geometry``).
+    """
     return {
+        "model_format": MODEL_FORMAT,
         "feature_version": FEATURE_VERSION,
-        "sl_atr_mult": scfg.sl_atr_mult,
-        "tp_atr_mult": scfg.tp_atr_mult,
-        "horizon_bars": scfg.horizon_bars,
         "atr_period": scfg.atr_period,
         "timeframe_minutes": scfg.timeframe_minutes,
     }
@@ -61,6 +68,8 @@ class TrainedModel:
     binner: QuantileBinner | None = None
     suspended: bool = False
     notes: list[str] = field(default_factory=list)
+    # Stop, target and holding time this model was trained for and trades with.
+    geometry: Geometry | None = None
 
     @property
     def tradeable(self) -> bool:
@@ -79,7 +88,7 @@ class TrainedModel:
         return pl, ps
 
     def is_compatible(self, scfg: StrategyConfig) -> bool:
-        return self.signature == strategy_signature(scfg)
+        return self.signature == strategy_signature(scfg) and self.geometry in scfg.geometries()
 
     def age_hours(self, now: datetime | None = None) -> float:
         now = now or datetime.now(timezone.utc)
@@ -100,10 +109,12 @@ class TrainedModel:
         tl = f"{self.thr_long:.2f}" if self.thr_long is not None else "off"
         ts = f"{self.thr_short:.2f}" if self.thr_short is not None else "off"
         state = "TRADEABLE" if self.tradeable else ("SUSPENDED" if self.suspended else "NOT TRADEABLE")
+        geo = self.geometry.label if self.geometry is not None else "?"
         return (
-            f"model {self.version} [{state}] thr long={tl} short={ts} | validation: "
+            f"model {self.version} [{state}] {geo}, thr long={tl} short={ts} | held-out test: "
             f"{m.get('trades', 0)} trades, exp={m.get('expectancy_r', 0):+.3f}R, "
-            f"PF={m.get('profit_factor', 0):.2f}, win={m.get('win_rate', 0):.1%}, "
+            f"PF={m.get('profit_factor', 0):.2f}, win={m.get('win_rate', 0):.1%} "
+            f"(tune: {m.get('tune_trades', 0)} trades, {m.get('tune_expectancy_r', 0):+.3f}R), "
             f"AUC long={m.get('auc_long', float('nan')):.3f} short={m.get('auc_short', float('nan')):.3f}"
         )
 
@@ -231,104 +242,162 @@ def recency_weights(n: int, half_life: int) -> np.ndarray:
     return np.power(0.5, age / half_life)
 
 
+def _policy_stats(pl: np.ndarray, ps: np.ndarray, thr_l: float | None, thr_s: float | None, L: pd.DataFrame) -> dict:
+    """Stats of trading ``L``'s rows with the given thresholds (one trade at a time)."""
+    direction = decide_vec(pl, ps, thr_l if thr_l is not None else math.inf, thr_s if thr_s is not None else math.inf)
+    rs, _ = simulate_policy(
+        direction,
+        L["long_r"].to_numpy(),
+        L["short_r"].to_numpy(),
+        L["long_exit"].to_numpy(),
+        L["short_exit"].to_numpy(),
+    )
+    return trade_stats(rs)
+
+
+def as_label_dict(labels, scfg: StrategyConfig) -> dict[Geometry, pd.DataFrame]:
+    """Accept one label frame (the base geometry) or a {geometry: frame} dict."""
+    if isinstance(labels, pd.DataFrame):
+        return {scfg.base_geometry: labels}
+    return dict(labels)
+
+
+def _proba(m, B: np.ndarray) -> np.ndarray:
+    return m.predict_proba(B)[:, 1] if m is not None else np.zeros(len(B))
+
+
 def train_model(
     features: pd.DataFrame,
-    labels: pd.DataFrame,
+    labels,
     scfg: StrategyConfig,
     lcfg: LearningConfig,
     sample_weight: np.ndarray | None = None,
     version: str | None = None,
 ) -> TrainedModel:
-    """Walk-forward train + validate + gate. ``features``/``labels`` are aligned."""
-    mask = labels["long_r"].notna() & labels["short_r"].notna() & features.notna().any(axis=1)
+    """Train a model per candidate geometry, keep the best, then gate it honestly.
+
+    ``labels`` maps each candidate :class:`Geometry` to its label frame (a
+    single frame means the base geometry). The newest ``validation_fraction``
+    of the rows is held out and split in two:
+
+    * **tune**: picks each side's confidence threshold and the geometry;
+    * **test**: used for no choice at all; the quality gates are measured here.
+
+    Earlier versions chose thresholds and graded the model on the same data,
+    which made validation look about 0.3R per trade better than live results.
+    """
+    labels = as_label_dict(labels, scfg)
+    geos = list(labels)
+    mask = features.notna().any(axis=1)
+    for L in labels.values():
+        mask &= L["long_r"].notna() & L["short_r"].notna()
     X = features.loc[mask]
-    L = labels.loc[mask]
+    Ls = {g: L.loc[mask] for g, L in labels.items()}
     w_all = np.ones(len(features)) if sample_weight is None else np.asarray(sample_weight, dtype=float)
     w_all = w_all[mask.to_numpy()]
     n = len(X)
     if n < lcfg.min_train_bars:
         raise InsufficientDataError(f"only {n} labelled bars, need {lcfg.min_train_bars}")
 
+    purge = max(g.horizon_bars for g in geos)
     n_val = int(n * lcfg.validation_fraction)
-    purge = scfg.horizon_bars
+    n_tune = n_val // 2
     tr_end = n - n_val - purge
-    if tr_end < n_val:
-        raise InsufficientDataError("not enough data for a train/validation split")
+    tune = slice(n - n_val, n - n_val + n_tune)
+    test = slice(n - n_val + n_tune + purge, n)
+    if tr_end < n_val or n - test.start < 500:
+        raise InsufficientDataError("not enough data for a train/tune/test split")
 
     w = w_all * recency_weights(n, lcfg.recency_half_life_bars)
-    X_tr, X_val = X.iloc[:tr_end], X.iloc[n - n_val :]
-    L_tr, L_val = L.iloc[:tr_end], L.iloc[n - n_val :]
+    binner = QuantileBinner().fit(X.iloc[:tr_end])
+    B_tr, B_tune, B_test = (binner.transform(X.iloc[part]) for part in (slice(0, tr_end), tune, test))
     w_tr = w[:tr_end]
 
-    binner = QuantileBinner().fit(X_tr)
-    B_tr, B_val = binner.transform(X_tr), binner.transform(X_val)
-    long_m = _fit(B_tr, L_tr["long_win"].to_numpy(), w_tr, lcfg)
-    short_m = _fit(B_tr, L_tr["short_win"].to_numpy(), w_tr, lcfg)
-    n_val_rows = len(X_val)
-    pl = long_m.predict_proba(B_val)[:, 1] if long_m is not None else np.zeros(n_val_rows)
-    ps = short_m.predict_proba(B_val)[:, 1] if short_m is not None else np.zeros(n_val_rows)
+    cands = []
+    for g in geos:
+        L = Ls[g]
+        L_tr, L_tune, L_test = L.iloc[:tr_end], L.iloc[tune], L.iloc[test]
+        long_m = _fit(B_tr, L_tr["long_win"].to_numpy(), w_tr, lcfg)
+        short_m = _fit(B_tr, L_tr["short_win"].to_numpy(), w_tr, lcfg)
+        pl_tu, ps_tu = _proba(long_m, B_tune), _proba(short_m, B_tune)
+        pl_te, ps_te = _proba(long_m, B_test), _proba(short_m, B_test)
+        # AUC involves no threshold, so tune + test together stays an honest estimate.
+        auc_l = _auc(np.concatenate([L_tune["long_win"].to_numpy(), L_test["long_win"].to_numpy()]), np.concatenate([pl_tu, pl_te]))
+        auc_s = _auc(np.concatenate([L_tune["short_win"].to_numpy(), L_test["short_win"].to_numpy()]), np.concatenate([ps_tu, ps_te]))
+        thr_l, info_l = select_threshold(pl_tu, L_tune["long_r"].to_numpy(), L_tune["long_exit"].to_numpy(), LONG, lcfg)
+        thr_s, info_s = select_threshold(ps_tu, L_tune["short_r"].to_numpy(), L_tune["short_exit"].to_numpy(), SHORT, lcfg)
+        # A side whose model cannot rank outcomes is noise, whatever its best threshold says.
+        if long_m is None or not auc_l >= lcfg.min_auc:
+            thr_l, info_l = None, {**info_l, "disabled": f"AUC {auc_l:.3f} < {lcfg.min_auc}"}
+        if short_m is None or not auc_s >= lcfg.min_auc:
+            thr_s, info_s = None, {**info_s, "disabled": f"AUC {auc_s:.3f} < {lcfg.min_auc}"}
+        tune_stats = _policy_stats(pl_tu, ps_tu, thr_l, thr_s, L_tune)
+        has_side = thr_l is not None or thr_s is not None
+        score = tune_stats["expectancy_r"] * math.sqrt(tune_stats["trades"]) if has_side and tune_stats["trades"] else -math.inf
+        cands.append({
+            "geometry": g, "long_m": long_m, "short_m": short_m, "thr_l": thr_l, "thr_s": thr_s,
+            "info_l": info_l, "info_s": info_s, "auc_l": auc_l, "auc_s": auc_s,
+            "tune": tune_stats, "score": score, "pl_te": pl_te, "ps_te": ps_te, "L_test": L_test,
+        })
 
-    auc_l = _auc(L_val["long_win"].to_numpy(), pl)
-    auc_s = _auc(L_val["short_win"].to_numpy(), ps)
-    thr_l, info_l = select_threshold(pl, L_val["long_r"].to_numpy(), L_val["long_exit"].to_numpy(), LONG, lcfg)
-    thr_s, info_s = select_threshold(ps, L_val["short_r"].to_numpy(), L_val["short_exit"].to_numpy(), SHORT, lcfg)
-    # A side whose model cannot rank outcomes is noise, whatever its best threshold says.
-    if long_m is None or not auc_l >= lcfg.min_auc:
-        thr_l, info_l = None, {**info_l, "disabled": f"AUC {auc_l:.3f} < {lcfg.min_auc}"}
-    if short_m is None or not auc_s >= lcfg.min_auc:
-        thr_s, info_s = None, {**info_s, "disabled": f"AUC {auc_s:.3f} < {lcfg.min_auc}"}
-
-    direction = decide_vec(
-        pl, ps, thr_l if thr_l is not None else math.inf, thr_s if thr_s is not None else math.inf
-    )
-    rs, _ = simulate_policy(
-        direction,
-        L_val["long_r"].to_numpy(),
-        L_val["short_r"].to_numpy(),
-        L_val["long_exit"].to_numpy(),
-        L_val["short_exit"].to_numpy(),
-    )
-    metrics = trade_stats(rs)
+    best = max(cands, key=lambda c: c["score"])  # ties keep the earliest (base) geometry
+    geometry, thr_l, thr_s = best["geometry"], best["thr_l"], best["thr_s"]
+    L_test = best["L_test"]
+    metrics = _policy_stats(best["pl_te"], best["ps_te"], thr_l, thr_s, L_test)
     metrics.update(
         {
-            "auc_long": auc_l,
-            "auc_short": auc_s,
-            "long_side": info_l,
-            "short_side": info_s,
+            "geometry": geometry.label,
+            "tune_trades": best["tune"]["trades"],
+            "tune_expectancy_r": best["tune"]["expectancy_r"],
+            "auc_long": best["auc_l"],
+            "auc_short": best["auc_s"],
+            "long_side": best["info_l"],
+            "short_side": best["info_s"],
             "train_rows": int(tr_end),
-            "val_rows": int(n_val_rows),
-            "val_start": str(X_val.index[0]),
-            "val_end": str(X_val.index[-1]),
-            "base_win_long": float(np.nanmean(L_val["long_win"])),
-            "base_win_short": float(np.nanmean(L_val["short_win"])),
+            "tune_rows": int(n_tune),
+            "test_rows": int(len(L_test)),
+            "val_start": str(L_test.index[0]),
+            "val_end": str(L_test.index[-1]),
+            "base_win_long": float(np.nanmean(L_test["long_win"])),
+            "base_win_short": float(np.nanmean(L_test["short_win"])),
+            "candidates": [
+                {
+                    "geometry": c["geometry"].label,
+                    "tune_trades": c["tune"]["trades"],
+                    "tune_expectancy_r": c["tune"]["expectancy_r"],
+                }
+                for c in cands
+            ],
         }
     )
     notes = []
     passed = True
     if thr_l is None and thr_s is None:
         passed = False
-        notes.append("no side shows a positive out-of-sample edge")
+        notes.append("no side shows a positive edge on the tune segment")
     if metrics["trades"] < lcfg.min_validation_trades:
         passed = False
-        notes.append(f"only {metrics['trades']} validation trades (< {lcfg.min_validation_trades})")
+        notes.append(f"only {metrics['trades']} held-out test trades (< {lcfg.min_validation_trades})")
     if metrics["expectancy_r"] < lcfg.min_validation_expectancy_r:
         passed = False
-        notes.append(f"expectancy {metrics['expectancy_r']:+.3f}R below {lcfg.min_validation_expectancy_r:+.3f}R")
+        notes.append(f"test expectancy {metrics['expectancy_r']:+.3f}R below {lcfg.min_validation_expectancy_r:+.3f}R")
     if metrics["profit_factor"] < lcfg.min_profit_factor:
         passed = False
-        notes.append(f"profit factor {metrics['profit_factor']:.2f} below {lcfg.min_profit_factor:.2f}")
+        notes.append(f"test profit factor {metrics['profit_factor']:.2f} below {lcfg.min_profit_factor:.2f}")
     if metrics["t_stat"] < lcfg.min_t_stat:
         passed = False
-        notes.append(f"t-stat {metrics['t_stat']:.2f} below {lcfg.min_t_stat:.2f} (edge not significant)")
+        notes.append(f"test t-stat {metrics['t_stat']:.2f} below {lcfg.min_t_stat:.2f} (edge not significant)")
 
+    binner_final, long_m, short_m = binner, best["long_m"], best["short_m"]
     if lcfg.refit_on_full_data:
-        # Use the most recent data too; thresholds come from the honest split above.
+        # Use the most recent data too; thresholds and geometry come from the split above.
+        L = Ls[geometry]
         binner_full = QuantileBinner().fit(X)
         B = binner_full.transform(X)
         long_full = _fit(B, L["long_win"].to_numpy(), w, lcfg)
         short_full = _fit(B, L["short_win"].to_numpy(), w, lcfg)
         if long_full is not None and short_full is not None:
-            binner, long_m, short_m = binner_full, long_full, short_full
+            binner_final, long_m, short_m = binner_full, long_full, short_full
 
     now = datetime.now(timezone.utc)
     return TrainedModel(
@@ -343,8 +412,9 @@ def train_model(
         metrics=metrics,
         signature=strategy_signature(scfg),
         passed=passed,
-        binner=binner,
+        binner=binner_final,
         notes=notes,
+        geometry=geometry,
     )
 
 
@@ -360,25 +430,33 @@ def choose_champion(
     champion: TrainedModel | None,
     challenger: TrainedModel,
     features: pd.DataFrame,
-    labels: pd.DataFrame,
+    labels,
     scfg: StrategyConfig,
     lcfg: LearningConfig,
 ) -> tuple[TrainedModel | None, str]:
     """Champion/challenger selection on data neither model was fitted on.
 
-    The champion is scored only on bars after its own training cut-off, so
-    both models are judged out-of-sample. Returns the model to use and why.
+    Both are scored on the challenger's held-out test segment, the champion
+    only on bars after its own training cut-off, each with its own geometry.
+    Returns the model to use and why.
     """
-    if champion is None or not champion.is_compatible(scfg) or not set(champion.feature_names) <= set(features.columns):
+    labels = as_label_dict(labels, scfg)
+    if (
+        champion is None
+        or not champion.is_compatible(scfg)
+        or not set(champion.feature_names) <= set(features.columns)
+        or champion.geometry not in labels
+    ):
         if challenger.passed:
             return challenger, "promoted: no compatible champion"
         return challenger, "no model passed quality gates; staying flat"
 
-    val_start = pd.Timestamp(challenger.metrics["val_start"])
-    oos = (features.index >= val_start) & (features.index > champion.trained_until)
-    known = labels["long_r"].notna().to_numpy() & labels["short_r"].notna().to_numpy()
+    L = labels[champion.geometry]
+    test_start = pd.Timestamp(challenger.metrics["val_start"])
+    oos = (features.index >= test_start) & (features.index > champion.trained_until)
+    known = L["long_r"].notna().to_numpy() & L["short_r"].notna().to_numpy()
     rows = oos & known
-    champ = evaluate_model(champion, features.loc[rows], labels.loc[rows])
+    champ = evaluate_model(champion, features.loc[rows], L.loc[rows])
     champ_n = champ["trades"]
     enough = champ_n >= max(5, lcfg.min_validation_trades // 2)
 

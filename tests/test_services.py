@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from quant_trader import services
 
@@ -34,3 +35,19 @@ def test_reset_halt_clears_kill_switch(cfg):
     state = j.get_state("risk_state")
     j.close()
     assert not state["halted"] and state["peak_equity"] == 0 and state["cooldown_until"] == ""
+
+
+def test_mt5_backtest_data_uses_broker_margin_and_saves_bars(cfg, noise_bars, monkeypatch, tmp_path):
+    from quant_trader.broker.sim import SimBroker
+
+    sim = SimBroker(noise_bars, leverage=500)
+    monkeypatch.setattr(services, "mt5_broker", lambda c: sim)
+    bars, spec, margin_rate = services.load_backtest_bars(cfg, "mt5", n_bars=5000)
+    assert len(bars) == 5000
+    assert margin_rate == pytest.approx(spec.contract_size / 500)  # 1:500, not the 1:100 default
+
+    from quant_trader.backtest import BacktestResult
+
+    res = BacktestResult(trades=pd.DataFrame(), equity=pd.Series(dtype=float), stats={}, models=[])
+    out = services.save_backtest(res, tmp_path / "bt", bars)
+    assert (out / "bars.csv").exists() and len(services.load_csv(out / "bars.csv")) == 5000

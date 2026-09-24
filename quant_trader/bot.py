@@ -6,6 +6,7 @@ import logging
 import math
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Callable
 
 import pandas as pd
@@ -16,7 +17,8 @@ from .features import WARMUP_BARS, build_features, compute_atr, prepare_bars
 from .instance import InstanceLock
 from .journal import Journal
 from .learner import SelfLearner
-from .policy import decide, entry_block_reason, manage_position
+from .news import NewsCalendar
+from .policy import ManageAction, decide, entry_block_reason, manage_position
 from .risk import RiskManager, RiskState
 
 log = logging.getLogger(__name__)
@@ -35,11 +37,13 @@ class TradingBot:
         learner: SelfLearner | None = None,
         sleep: Callable[[float], None] = time.sleep,
         wall_clock: Callable[[], float] = time.time,
+        news: NewsCalendar | None = None,
     ):
         self.cfg = cfg
         self.broker = broker
         self.journal = journal or Journal(cfg.db_path)
         self.learner = learner or SelfLearner(cfg, self.journal)
+        self.news = news or NewsCalendar(cfg.news, cfg.path(cfg.data_dir) / "news_calendar.json")
         self.risk = RiskManager(cfg.risk)
         self.state = RiskState.from_dict(self.journal.get_state("risk_state"))
         self.sleep = sleep
@@ -167,7 +171,8 @@ class TradingBot:
         try:
             spec = self.broker.symbol_spec()
             lc = self.cfg.learning
-            needed = lc.train_bars + WARMUP_BARS + self.cfg.strategy.horizon_bars + 100
+            longest = max(g.horizon_bars for g in self.cfg.strategy.geometries())
+            needed = lc.train_bars + WARMUP_BARS + longest + 100
             bars = prepare_bars(self.broker.rates(needed), self._default_spread_points(spec))
             self.learner.retrain(bars, spec.point, reason)
         except BrokerError as exc:
@@ -192,6 +197,10 @@ class TradingBot:
         report["bar_time"] = last_bar
 
         self._sync_closed(now)
+        try:
+            self.news.refresh()
+        except Exception:
+            log.warning("News calendar refresh failed", exc_info=True)
         account = self.broker.account()
         self.risk.update_equity(self.state, now, account.equity)
         self.journal.log_equity(now, account.balance, account.equity)
@@ -260,6 +269,7 @@ class TradingBot:
                 "positions": [asdict(p) for p in positions],
                 "risk": self.state.to_dict(),
                 "model": self.learner.status(),
+                "news": self.news.status(self._utc_now()),
             }
         except Exception:
             log.debug("Could not build status snapshot", exc_info=True)
@@ -289,8 +299,11 @@ class TradingBot:
         )
 
         reason = None
+        news = self.news.blackout(self._utc_now()) if direction != 0 else None
         if direction == 0:
             reason = "no signal"
+        elif news is not None:
+            reason = f"high-impact news: {news.describe()}"
         else:
             reason = entry_block_reason(now, spread, atr_now, float(bar["high"] - bar["low"]), scfg)
             if reason is None:
@@ -301,10 +314,12 @@ class TradingBot:
             self.journal.log_signal(**signal_row, action="skip", reason=reason)
             return
 
+        # The stop/target/holding time the model was trained for.
+        geo = getattr(model, "geometry", None) or scfg.base_geometry
         entry_ref = tick.ask if direction == LONG else tick.bid
         min_dist = (spec.stops_level + 10) * spec.point
-        sl_dist = max(scfg.sl_atr_mult * atr_now, min_dist)
-        tp_dist = max(scfg.tp_atr_mult * atr_now, min_dist)
+        sl_dist = max(geo.sl_atr_mult * atr_now, min_dist)
+        tp_dist = max(geo.tp_atr_mult * atr_now, min_dist)
         sl = spec.round_price(entry_ref - direction * sl_dist)
         tp = spec.round_price(entry_ref + direction * tp_dist)
         volume, _ = self.risk.position_size(account.equity, sl_dist, spec, risk_mult)
@@ -350,6 +365,9 @@ class TradingBot:
             model_version=model.version,
             features=row.iloc[0].to_dict(),
             status="open",
+            sl_atr_mult=geo.sl_atr_mult,
+            tp_atr_mult=geo.tp_atr_mult,
+            horizon_bars=geo.horizon_bars,
         )
         self.risk.register_entry(self.state)
         self.journal.log_signal(**signal_row, action="open", reason=desc)
@@ -357,18 +375,28 @@ class TradingBot:
         log.info("OPENED #%s %s", res.ticket, desc)
 
     # --- open positions ---------------------------------------------------
+    def _utc_now(self) -> datetime:
+        return datetime.fromtimestamp(self.wall_clock(), timezone.utc)
+
     def _bars_held(self, pos: Position, last_bar: pd.Timestamp) -> int:
         entry_close = pos.time.floor(self.bar_delta)
         return int((last_bar + self.bar_delta - entry_close) / self.bar_delta)
 
     def _manage_positions(self, positions: list[Position], tick: Tick, atr_now: float, now, last_bar, spec: SymbolSpec) -> None:
         closed_any = False
+        utc = self._utc_now()
+        upcoming = self.news.blackout(utc) if self.cfg.news.close_positions_before else None
+        close_for_news = upcoming is not None and utc < upcoming.time
         for pos in positions:
             rec = self.journal.get_trade(pos.ticket) or self._adopt(pos, atr_now, spec)
-            action = manage_position(
-                pos.direction, pos.price_open, pos.sl, rec["initial_risk"] or 0.0,
-                tick.bid, tick.ask, atr_now, self._bars_held(pos, last_bar), now, self.cfg.strategy,
-            )
+            if close_for_news:
+                action = ManageAction("close", "news")
+            else:
+                action = manage_position(
+                    pos.direction, pos.price_open, pos.sl, rec["initial_risk"] or 0.0,
+                    tick.bid, tick.ask, atr_now, self._bars_held(pos, last_bar), now, self.cfg.strategy,
+                    horizon_bars=rec.get("horizon_bars") or self.cfg.strategy.horizon_bars,
+                )
             if action is None:
                 continue
             if self.cfg.dry_run:
@@ -383,6 +411,10 @@ class TradingBot:
                     log.error("Close #%s failed: retcode %s %s", pos.ticket, res.retcode, res.comment)
             else:
                 new_sl = spec.round_price(action.sl)
+                # After rounding to the broker's price step the stop may not move at all.
+                improves = new_sl > pos.sl if pos.direction == LONG else (pos.sl <= 0 or new_sl < pos.sl)
+                if not improves:
+                    continue
                 gap = (tick.bid - new_sl) if pos.direction == LONG else (new_sl - tick.ask)
                 if gap < (spec.stops_level + spec.freeze_level + 1) * spec.point:
                     continue

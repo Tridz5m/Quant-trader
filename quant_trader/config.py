@@ -13,6 +13,7 @@ filters aligned with the London / New York sessions all year round.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_type_hints
@@ -57,6 +58,19 @@ class ScheduleConfig:
     stale_data_minutes: int = 15
 
 
+@dataclass(frozen=True)
+class Geometry:
+    """Stop, target and maximum holding time of a trade."""
+
+    sl_atr_mult: float
+    tp_atr_mult: float
+    horizon_bars: int
+
+    @property
+    def label(self) -> str:
+        return f"SL {self.sl_atr_mult:g}xATR / TP {self.tp_atr_mult:g}xATR / max {self.horizon_bars} bars"
+
+
 @dataclass
 class StrategyConfig:
     timeframe_minutes: int = 5
@@ -64,6 +78,10 @@ class StrategyConfig:
     sl_atr_mult: float = 1.5
     tp_atr_mult: float = 2.25
     horizon_bars: int = 36
+    # Extra [stop x ATR, target x ATR, max bars] combinations the learner may
+    # use instead of the one above, whichever works best on unseen data. Wider
+    # stops pay relatively less spread and noise. [] = always use the above.
+    candidate_geometries: list = field(default_factory=lambda: [[2.5, 3.75, 72], [4.0, 6.0, 144]])
     # Round-trip slippage/commission allowance in price units, used in labels
     # and backtests so the model learns from realistic outcomes.
     slippage: float = 0.05
@@ -84,15 +102,28 @@ class StrategyConfig:
     trailing_start_r: float | None = None
     trailing_atr_mult: float = 1.0
 
+    @property
+    def base_geometry(self) -> Geometry:
+        return Geometry(float(self.sl_atr_mult), float(self.tp_atr_mult), int(self.horizon_bars))
+
+    def geometries(self) -> list[Geometry]:
+        """The base geometry followed by the configured candidates (no duplicates)."""
+        out = [self.base_geometry]
+        for c in self.candidate_geometries or []:
+            g = Geometry(float(c[0]), float(c[1]), int(c[2]))
+            if g not in out:
+                out.append(g)
+        return out
+
 
 @dataclass
 class RiskConfig:
-    risk_per_trade_pct: float = 0.5
+    risk_per_trade_pct: float = 1.0
     max_open_positions: int = 1
     max_trades_per_day: int = 8
-    max_daily_loss_pct: float = 2.0
+    max_daily_loss_pct: float = 3.0
     # Hard kill switch: stop trading until `reset-halt` is run.
-    max_drawdown_pct: float = 10.0
+    max_drawdown_pct: float = 15.0
     max_consecutive_losses: int = 3
     cooldown_minutes: int = 120
     max_margin_usage_pct: float = 30.0
@@ -110,7 +141,10 @@ class LearningConfig:
     model_dir: str = "models"
     train_bars: int = 40_000
     min_train_bars: int = 8_000
-    validation_fraction: float = 0.25
+    # The newest part of the training window is held out. Its first half picks
+    # the confidence thresholds and stop geometry; the second half, never used
+    # for any choice, decides whether the model may trade.
+    validation_fraction: float = 0.30
     retrain_every_hours: float = 24.0
     # When no tradeable model exists, retry training this often.
     retry_hours: float = 6.0
@@ -118,20 +152,21 @@ class LearningConfig:
     early_retrain_trades: int = 8
     early_retrain_expectancy_r: float = -0.3
     min_hours_between_retrains: float = 4.0
-    # Quality gates a model must pass on out-of-sample data before it trades.
-    min_validation_trades: int = 30
+    # Quality gates, measured on held-out data none of the model's settings
+    # were chosen on.
+    min_validation_trades: int = 20
     min_validation_expectancy_r: float = 0.05
     min_profit_factor: float = 1.10
-    # Expectancy t-statistic (mean / std * sqrt(trades)) on validation trades.
+    # Expectancy t-statistic (mean / std * sqrt(trades)) on held-out trades.
     min_t_stat: float = 2.0
     # A side is only enabled if its model ranks outcomes better than chance.
     min_auc: float = 0.52
     threshold_min: float = 0.30
     threshold_max: float = 0.80
     threshold_step: float = 0.01
-    # A challenger replaces the champion unless the champion is doing better
-    # on data it has never seen by more than this many R per trade.
-    champion_tolerance_r: float = 0.02
+    # A challenger replaces the champion only if it is better by at least this
+    # many R per trade on data neither model was trained on.
+    champion_tolerance_r: float = 0.05
     recency_half_life_bars: int = 15_000
     live_trade_weight: float = 3.0
     refit_on_full_data: bool = True
@@ -143,6 +178,20 @@ class LearningConfig:
     min_samples_leaf: int = 200
     l2_regularization: float = 1.0
     keep_models: int = 10
+
+
+@dataclass
+class NewsConfig:
+    # Skip new trades around high-impact news from the weekly economic calendar.
+    enabled: bool = True
+    currencies: list = field(default_factory=lambda: ["USD"])
+    impacts: list = field(default_factory=lambda: ["High"])
+    minutes_before: int = 30
+    minutes_after: int = 30
+    # Also close open trades this bot holds when such news is about to start.
+    close_positions_before: bool = False
+    refresh_hours: float = 4.0
+    feed_url: str = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 
 @dataclass
@@ -158,6 +207,7 @@ class BotConfig:
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     learning: LearningConfig = field(default_factory=LearningConfig)
+    news: NewsConfig = field(default_factory=NewsConfig)
     # Directory relative paths are resolved against (set by the loader).
     base_dir: str = "."
 
@@ -199,6 +249,23 @@ def _from_dict(cls: type, data: Any, path: str) -> Any:
     return cls(**kwargs)
 
 
+def _valid_candidates(cands: Any) -> bool:
+    if cands is None:
+        return True
+    if not isinstance(cands, list) or len(cands) > 4:
+        return False
+    for c in cands:
+        if not isinstance(c, (list, tuple)) or len(c) != 3:
+            return False
+        try:
+            sl, tp, bars = float(c[0]), float(c[1]), int(c[2])
+        except (TypeError, ValueError):
+            return False
+        if sl <= 0 or tp <= 0 or bars < 2:
+            return False
+    return True
+
+
 def validate(cfg: BotConfig) -> None:
     s, r, lc = cfg.strategy, cfg.risk, cfg.learning
     checks = [
@@ -209,12 +276,15 @@ def validate(cfg: BotConfig) -> None:
         (r.min_lot_risk_tolerance >= 1.0, "risk.min_lot_risk_tolerance must be >= 1"),
         (s.sl_atr_mult > 0 and s.tp_atr_mult > 0, "strategy SL/TP multipliers must be > 0"),
         (s.horizon_bars >= 2, "strategy.horizon_bars must be >= 2"),
+        (_valid_candidates(s.candidate_geometries),
+         "strategy.candidate_geometries must be a list of up to 4 [stop, target, bars] entries with positive values"),
         (s.timeframe_minutes == 5, "strategy.timeframe_minutes must be 5 (M5 scanning)"),
         (0 <= s.session_start_hour < s.session_end_hour <= 24, "invalid session hours"),
         (0.05 <= lc.validation_fraction <= 0.5, "learning.validation_fraction must be in [0.05, 0.5]"),
         (lc.threshold_min < lc.threshold_max, "learning.threshold_min must be < threshold_max"),
         (lc.min_train_bars >= 1000, "learning.min_train_bars must be >= 1000"),
         (cfg.schedule.scan_interval_seconds >= 60, "schedule.scan_interval_seconds must be >= 60"),
+        (cfg.news.minutes_before >= 0 and cfg.news.minutes_after >= 0, "news minutes must be >= 0"),
     ]
     errors = [msg for ok, msg in checks if not ok]
     if errors:
@@ -231,6 +301,62 @@ def _apply_env(cfg: BotConfig) -> None:
         cfg.mt5.server = env["MT5_SERVER"]
     if env.get("MT5_TERMINAL_PATH"):
         cfg.mt5.terminal_path = env["MT5_TERMINAL_PATH"]
+
+
+def _yaml_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return repr(value)
+    return str(value)
+
+
+def set_config_value(path: str | Path, section: str, key: str, value: Any) -> None:
+    """Set ``section.key`` in a YAML config file, keeping comments and layout.
+
+    The result is validated; on an invalid value the file is left unchanged
+    and :class:`ConfigError` is raised.
+    """
+    path = Path(path)
+    # Read raw bytes: read_text() would silently turn Windows line endings into "\n".
+    original = path.read_bytes().decode("utf-8") if path.exists() else ""
+    lines = original.splitlines(keepends=True)
+    new_val = _yaml_scalar(value)
+    newline = "\r\n" if "\r\n" in original else "\n"
+    key_re = re.compile(rf"^(\s+){re.escape(key)}:(\s*)([^#]*?)(\s+#.*)?$")
+    section_at = None
+    done = False
+    for i, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        if re.match(rf"^{re.escape(section)}:\s*(#.*)?$", body):
+            section_at = i
+            continue
+        if section_at is not None and body and not body[0].isspace() and not body.startswith("#"):
+            break  # left the section
+        if section_at is not None:
+            m = key_re.match(body)
+            if m:
+                indent, space, old_val, comment = m.groups()
+                shown = new_val.ljust(len(old_val)) if comment else new_val
+                lines[i] = f"{indent}{key}:{space or ' '}{shown}{comment or ''}{ending}"
+                done = True
+                break
+    if not done:
+        if section_at is not None:
+            lines.insert(section_at + 1, f"  {key}: {new_val}{newline}")
+        else:
+            if lines and not lines[-1].endswith("\n"):
+                lines.append(newline)
+            lines.append(f"{newline}{section}:{newline}  {key}: {new_val}{newline}")
+    path.write_text("".join(lines), encoding="utf-8", newline="")
+    try:
+        load_config(path)
+    except ConfigError:
+        path.write_text(original, encoding="utf-8", newline="")
+        raise
 
 
 def load_config(path: str | Path | None = None) -> BotConfig:

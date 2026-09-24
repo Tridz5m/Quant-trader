@@ -33,7 +33,10 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_price REAL,
     profit REAL,
     r_multiple REAL,
-    close_reason TEXT
+    close_reason TEXT,
+    sl_atr_mult REAL,
+    tp_atr_mult REAL,
+    horizon_bars INTEGER
 );
 CREATE TABLE IF NOT EXISTS signals (
     time TEXT,
@@ -83,7 +86,15 @@ class Journal:
             # Lets the desktop app read while the bot writes.
             self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a journal was created."""
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(trades)").fetchall()}
+        for col, kind in (("sl_atr_mult", "REAL"), ("tp_atr_mult", "REAL"), ("horizon_bars", "INTEGER")):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {kind}")
 
     def close(self) -> None:
         self.conn.close()

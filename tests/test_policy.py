@@ -93,3 +93,10 @@ def test_trailing_stop():
     assert act.kind == "modify" and math.isclose(act.sl, 104)
     # Never loosen: a lower trail than the current stop is ignored.
     assert manage_position(LONG, 100, 105, 3, 106, 106.3, 2, 5, WED_NOON, cfg) is None
+
+
+def test_trade_horizon_overrides_config():
+    cfg = StrategyConfig()
+    assert manage_position(LONG, 100, 97, 3, 100.5, 100.8, 2, 40, WED_NOON, cfg, horizon_bars=144) is None
+    act = manage_position(LONG, 100, 97, 3, 100.5, 100.8, 2, 12, WED_NOON, cfg, horizon_bars=12)
+    assert act.kind == "close" and act.reason == "time_exit"

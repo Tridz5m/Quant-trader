@@ -24,29 +24,32 @@ Every 5 minutes (a few seconds after each M5 candle closes) the bot:
 1. **Syncs** with MT5: records trades that closed (stop, target, time exit),
    updates equity, daily loss and drawdown tracking.
 2. **Manages open trades**: moves the stop to break-even at +1R (optional
-   trailing stop), closes trades after 3 hours (the model's horizon), and
-   closes before the weekend.
+   trailing stop), closes trades when their maximum holding time is up (3,
+   6 or 12 hours depending on the stop geometry), and closes before the weekend.
 3. **Scores the market**: builds ~50 features from the last 6,000 M5 bars
    (trend, momentum, volatility regime, candle shape, session/time of day,
    daily levels, H1/H4 context). Every feature is causal (no look-ahead) and
    normalised by ATR, so it works at any gold price.
 4. **Asks the model** for two probabilities: *P(long hits its target before
    its stop)* and *P(short hits its target before its stop)*.
-5. **Filters**: trading session, spread, abnormal (news) candles, and risk
+5. **Filters**: high-impact news (no new trades from 30 minutes before to 30
+   minutes after US events such as NFP, CPI and FOMC, from the weekly
+   economic calendar), trading session, spread, abnormal candles, and risk
    limits (max positions, trades per day, daily loss, cooldown after
    losses, drawdown kill switch).
-6. **Executes**: a market order with the stop at 1.5×ATR and the target at
-   2.25×ATR (1.5R), sized so the stop loses a fixed % of equity (default
-   0.5%) and capped by free margin.
+6. **Executes**: a market order with a server-side stop and target (1.5R),
+   using the stop geometry the learner chose (1.5, 2.5 or 4 × ATR), sized so
+   the stop loses a fixed % of equity (default **1%**) and capped by free margin.
 
 ### The self-learning loop
 
 | Mechanism | What it does |
 |---|---|
 | **Rolling retraining** | Every 24 h the bot downloads the last ~40,000 M5 bars and retrains, so it adapts to the current gold regime. Recent data is weighted more heavily. |
-| **Honest validation** | Each model is trained on older data and tested on newer data it has never seen, with a purge gap so labels can't leak. The confidence threshold is chosen on that unseen data. |
-| **Quality gates** | A model only trades if its out-of-sample results pass: enough trades, positive expectancy, profit factor > 1.1, t-stat ≥ 2, and a model AUC above chance. **If no edge is found, the bot stays flat** instead of gambling. |
-| **Champion / challenger** | A new model replaces the running one only if it is at least as good on data *neither* model was trained on. |
+| **Honest validation** | Each model is trained on older data. Newer, unseen data is split in two: the first part picks the confidence thresholds and the stop geometry, the second part (used for no choice at all) grades the model. Purge gaps keep labels from leaking. Grading on the same data the thresholds were picked on made models look about 0.3R per trade better than they really were; on pure noise it reported +0.42R per trade where the honest test shows -0.06R. |
+| **Stop geometry** | The bot trains a model for several stop/target/holding-time combinations (1.5, 2.5 and 4 × ATR) and keeps the one that works best on recent data. Tight M5 stops lose a large share of each trade to spread and noise; wider ones lose less. |
+| **Quality gates** | A model only trades if its results on the held-out data pass: enough trades, positive expectancy, profit factor > 1.1, t-stat ≥ 2, and a model AUC above chance. **If no edge is found, the bot stays flat** instead of gambling. |
+| **Champion / challenger** | A new model replaces the running one only if it is clearly better (by 0.05R per trade) on data *neither* model was trained on. |
 | **Learning from its own trades** | Every real trade (real fill, spread, slippage and management) replaces the simulated label for that bar and counts 3× in the next training run. |
 | **Self-suspension** | If the running model starts losing on new data and no better model can be found, trading is suspended until one is. |
 | **Adaptive risk** | After a losing streak the bot halves its risk and demands higher confidence. A string of losses also triggers an early retrain. |
@@ -86,9 +89,13 @@ What's in the window:
   limits (trades today, daily loss limit, kill switch).
 - **Live log**, **Open positions** and **Trade history** tabs.
 - **Train now** and **Backtest...** (MT5 history, a CSV file, or synthetic
-  demo data); results are saved in `backtest_results\`.
+  demo data); results are saved in `backtest_results\`. Backtests on MT5
+  data size positions with your broker's real margin and also save the price
+  bars (`bars.csv`) for further analysis.
+- **Change risk...** sets the % of the account risked per trade (default 1%).
 - **Settings** opens `config.yaml` in Notepad; changes apply the next time you
   start, train or backtest. *Tools → Reset kill switch* clears the drawdown halt.
+- *File → Export MT5 history (CSV)* saves your broker's XAUUSD M5 history.
 
 Build the exe yourself (needs Python): double-click `build_exe.bat`. It
 installs PyInstaller, builds `dist\QuantTrader.exe` and runs the exe's
@@ -189,13 +196,20 @@ and keep `risk.risk_per_trade_pct` small.
   `XAUUSDm`, `XAUUSD.a`, `GOLD`...) and refuses anything else.
 - Refuses **real accounts** unless `allow_real_account: true`.
 - Every order carries a **server-side stop-loss and take-profit**.
-- **Fixed-fractional sizing** plus a free-margin cap. If even the broker's
-  minimum lot would exceed your risk budget, the trade is skipped.
-- **Daily loss limit** (default 2%), **max trades per day**, **max open
+- **Fixed-fractional sizing** (default 1% per trade) plus a free-margin cap.
+  If even the broker's minimum lot would exceed your risk budget, the trade is skipped.
+- **Daily loss limit** (default 3%), **max trades per day**, **max open
   positions**, **cooldown** after 3 consecutive losses.
-- **Kill switch** at 10% drawdown from the equity peak (clear it with `reset-halt`).
+- **Kill switch** at 15% drawdown from the equity peak (clear it with `reset-halt`).
+- **No new trades around high-impact US news**: the bot downloads the free
+  weekly economic calendar (ForexFactory feed, cached in `data/`) and pauses
+  entries from 30 minutes before to 30 minutes after events like NFP, CPI and
+  FOMC. Optionally it also closes open trades before the news
+  (`news.close_positions_before`). If the calendar can't be downloaded the
+  app shows it in red and the last cached copy is used. Backtests can't apply
+  this filter because the feed only covers the current week.
 - **No trading** outside session hours, around the daily rollover, late
-  Friday, on wide spreads, or right after abnormal news candles.
+  Friday, on wide spreads, or right after abnormal (news spike) candles.
 - Unknown config keys are rejected, so a typo can't silently disable a limit.
 - Only manages positions carrying its own **magic number**; your manual
   trades are left alone.
@@ -206,11 +220,12 @@ Next to `QuantTrader.exe` (or in the Quant-trader folder when run from source):
 
 | Path | Contents |
 |---|---|
-| `config.yaml` | Your settings (created from `config.example.yaml` on first start) |
+| `config.yaml` | Your settings (created from `config.example.yaml` on first start; an unedited file from an older version is updated to the new defaults, the old one kept as `config.old.yaml`) |
 | `logs/bot.log` | Every scan, signal, order and training run (rotated) |
 | `data/journal.sqlite` | Trades (with the features at entry), signals, equity, model history, risk state |
 | `models/champion.joblib` | The model currently trading, plus recent history models |
-| `backtest_results/` | `trades.csv`, `equity.csv`, `models.csv` per backtest |
+| `backtest_results/` | `trades.csv`, `equity.csv`, `models.csv` (and `bars.csv` for MT5 data) per backtest |
+| `exports/` | XAUUSD M5 history exported with *File → Export MT5 history* |
 
 ## Project layout
 

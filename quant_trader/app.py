@@ -36,6 +36,7 @@ COLORS = {
     "STOPPING": "#b45309",
     "TRAINING": "#7c3aed",
     "BACKTESTING": "#7c3aed",
+    "EXPORTING": "#7c3aed",
 }
 GREEN, RED, AMBER = "#15803d", "#b91c1c", "#b45309"
 
@@ -50,9 +51,9 @@ GUIDE = """\
 
 On the first start the bot downloads XAUUSD history and trains its model, which takes a few minutes. If it finds no reliable edge it stays flat and retries every 6 hours. That is deliberate, not an error.
 
-The bot scans on every 5-minute candle close while this window is open. Every trade has a stop loss and take profit on the broker's server, so open trades stay protected if you close the app.
+The bot scans on every 5-minute candle close while this window is open. It opens no new trades from 30 minutes before to 30 minutes after high-impact US news (NFP, CPI, FOMC...) from the weekly economic calendar. Every trade has a stop loss and take profit on the broker's server, so open trades stay protected if you close the app.
 
-Settings such as risk per trade, the daily loss limit and trading hours are in config.yaml (File > Settings). Real-money accounts are refused until you set allow_real_account: true there. Test on demo for several weeks first."""
+Risk per trade is set with the "Change risk..." button (default 1% of the account). Other settings such as the daily loss limit and trading hours are in config.yaml (File > Settings). Real-money accounts are refused until you set allow_real_account: true there. Test on demo for several weeks first."""
 
 
 class QueueLogHandler(logging.Handler):
@@ -189,7 +190,10 @@ class App:
         self.tk, self.ttk = tk, ttk
         self.root = root
         self.home = home
+        from .paths import upgrade_untouched_config
+
         first_run = not (home / "config.yaml").exists()
+        upgraded = upgrade_untouched_config(home)
         self.config_path = ensure_config(home)
         self.events: queue.Queue = queue.Queue()
         self.log_queue: queue.Queue = queue.Queue()
@@ -213,6 +217,9 @@ class App:
         self._build_ui()
         self._configure_logging()
         log.info("%s ready. Files are kept in %s", APP_NAME, self.home)
+        if upgraded:
+            log.info("config.yaml updated to the new defaults (1%% risk per trade, smarter validation). "
+                     "Your previous file is saved as config.old.yaml.")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(self.POLL_MS, self._poll)
         self.root.after(50, self._refresh)
@@ -277,11 +284,13 @@ class App:
         file_menu.add_command(label="Settings (config.yaml)...", command=self.on_settings)
         file_menu.add_command(label="Open app folder", command=lambda: open_path(self.home))
         file_menu.add_command(label="Open log file", command=self.on_open_log)
+        file_menu.add_command(label="Export MT5 history (CSV)...", command=self.on_export_history)
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.on_close)
         self.tools_menu = tk.Menu(menubar, tearoff=False)
         self.tools_menu.add_command(label="Train now", command=self.on_train)
         self.tools_menu.add_command(label="Backtest...", command=self.on_backtest)
+        self.tools_menu.add_command(label="Risk per trade...", command=self.on_change_risk)
         self.tools_menu.add_separator()
         self.tools_menu.add_command(label="Reset kill switch...", command=self.on_reset_halt)
         help_menu = tk.Menu(menubar, tearoff=False)
@@ -312,9 +321,9 @@ class App:
         grid = ttk.Frame(root, padding=(10, 4, 10, 4))
         grid.pack(fill="x")
         sections = [
-            ("Bot", ["State", "Last scan", "Decision", "Next scan"]),
+            ("Bot", ["State", "Last scan", "Decision", "Next scan", "News"]),
             ("Account", ["Account", "Balance", "Equity", "Open P/L"]),
-            ("Model", ["Trained", "Status", "Thresholds", "Validation"]),
+            ("Model", ["Trained", "Status", "Stop / target", "Thresholds", "Validation"]),
             ("Risk", ["Per trade", "Trades today", "Daily limit", "Kill switch"]),
         ]
         self.fields: dict[tuple[str, str], object] = {}
@@ -333,6 +342,9 @@ class App:
                 value_labels.append(v)
                 self.fields[(title, key)] = v
             lf.bind("<Configure>", self._rewrap(key_labels, value_labels))
+            if title == "Risk":
+                self.risk_btn = ttk.Button(lf, text="Change risk...", command=self.on_change_risk)
+                self.risk_btn.grid(row=len(keys), column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         nb = ttk.Notebook(root)
         nb.pack(fill="both", expand=True, padx=10, pady=(6, 4))
@@ -468,14 +480,62 @@ class App:
 
             cfg = load_config(self.config_path)
             log.info("Backtest: loading %s data...", source)
-            bars, spec = load_backtest_bars(cfg, source, csv_path or None, n_bars or None)
+            bars, spec, margin_rate = load_backtest_bars(cfg, source, csv_path or None, n_bars or None)
             log.info("Backtesting %d bars %s -> %s (retraining every %s days)...",
                      len(bars), bars.index[0], bars.index[-1], retrain_days)
-            res = backtest(cfg, bars, spec, retrain_days, equity, commission)
-            save_backtest(res, out_dir)
+            res = backtest(cfg, bars, spec, retrain_days, equity, commission, margin_rate)
+            save_backtest(res, out_dir, bars if source == "mt5" else None)
             return res, out_dir, source
 
         self.worker.submit("backtest", job)
+
+    def on_change_risk(self) -> None:
+        from tkinter import messagebox, simpledialog
+
+        from .config import ConfigError, set_config_value
+
+        cfg = self._cfg_or_warn()
+        if cfg is None:
+            return
+        value = simpledialog.askfloat(
+            "Risk per trade",
+            "Percent of your account balance to risk on each trade\n"
+            "(what you lose when the stop-loss is hit):",
+            initialvalue=cfg.risk.risk_per_trade_pct, minvalue=0.1, maxvalue=5.0, parent=self.root,
+        )
+        if value is None:
+            return
+        value = round(value, 2)
+        if value > 2 and not messagebox.askyesno(
+            "High risk",
+            f"{value:g}% per trade is aggressive: ten losing trades in a row would cost about "
+            f"{100 * (1 - (1 - value / 100) ** 10):.0f}% of the account.\n\nUse {value:g}% anyway?",
+        ):
+            return
+        try:
+            set_config_value(self.config_path, "risk", "risk_per_trade_pct", float(value))
+        except (ConfigError, OSError) as exc:
+            messagebox.showerror("Risk per trade", str(exc))
+            return
+        self._slow_at = 0.0
+        running = self.worker.busy and self.worker.job == "bot"
+        log.info("Risk per trade set to %g%%%s.", value, " - stop and start the bot to apply it" if running else "")
+
+    def on_export_history(self) -> None:
+        cfg = self._cfg_or_warn()
+        if cfg is None or self.worker.busy:
+            return
+        out = self.home / "exports" / f"xauusd_m5_{datetime.now():%Y-%m-%d}.csv"
+        self.notebook.select(0)
+        log.info("Exporting XAUUSD M5 history from MT5...")
+
+        def job():
+            from .config import load_config
+            from .services import export_history
+
+            return export_history(load_config(self.config_path), out)
+
+        self.worker.submit("export", job)
 
     def on_reset_halt(self) -> None:
         from tkinter import messagebox
@@ -598,14 +658,23 @@ class App:
                 messagebox.showinfo("Training finished", f"The model found an edge and will trade.\n\n{model.summary()}")
             else:
                 reasons = "\n".join(f"- {n}" for n in model.notes) or "- see log"
+                tried = "\n".join(
+                    f"- {c['geometry']}: {c['tune_trades']} trades, {c['tune_expectancy_r']:+.2f}R per trade"
+                    for c in model.metrics.get("candidates", [])
+                )
                 messagebox.showinfo(
                     "Training finished",
                     "No reliable edge in recent data, so the bot will stay flat (no trades) "
-                    f"and retry later. This is deliberate.\n\n{reasons}",
+                    "and retry every 6 hours. This protects your account; it is not an error.\n\n"
+                    f"Why:\n{reasons}" + (f"\n\nStop sizes tried (on the tune data):\n{tried}" if tried else ""),
                 )
         elif job == "backtest":
             res, out_dir, source = payload
             BacktestResultWindow(self, res, out_dir, source)
+        elif job == "export":
+            path, n = payload
+            messagebox.showinfo("Export finished", f"Saved {n:,} M5 bars of XAUUSD history to:\n\n{path}")
+            open_path(path.parent)
 
     # --- status refresh ---------------------------------------------------
     def _set(self, section: str, key: str, text: str, color: str | None = None) -> None:
@@ -650,7 +719,7 @@ class App:
                 return "STARTING"
             return "DRY RUN" if bot.cfg.dry_run else "RUNNING"
         if busy:
-            return "TRAINING" if job == "train" else "BACKTESTING"
+            return {"train": "TRAINING", "export": "EXPORTING"}.get(job, "BACKTESTING")
         return "STOPPED"
 
     def _refresh_status(self) -> None:
@@ -671,6 +740,7 @@ class App:
         self.stop_btn.configure(state="normal" if can_stop else "disabled")
         for w in (self.train_btn, self.backtest_btn, self.dry_chk):
             w.configure(state="normal" if idle else "disabled")
+        self.risk_btn.configure(state="disabled" if self._closing else "normal")
         for label in ("Train now", "Backtest...", "Reset kill switch..."):
             self.tools_menu.entryconfigure(label, state="normal" if idle else "disabled")
 
@@ -685,6 +755,7 @@ class App:
             self._set("Bot", "Next scan", f"in {secs // 60}:{secs % 60:02d}")
         else:
             self._set("Bot", "Next scan", "-")
+        self._show_news(snap.get("news") if running else None)
 
         acc = snap.get("account") if snap else None  # last known values stay visible after stopping
         if acc:
@@ -734,10 +805,26 @@ class App:
             return "Connected - waiting for the next candle"
         return f"{reason or action}{probs}"
 
+    def _show_news(self, n: dict | None) -> None:
+        if not n:
+            self._set("Bot", "News", "-")
+        elif not n.get("enabled"):
+            self._set("Bot", "News", "filter off")
+        elif n.get("blackout"):
+            until = fmt_time(n.get("blackout_until"))
+            self._set("Bot", "News", f"PAUSED for {n['blackout']} (until {until} UTC)", AMBER)
+        elif not n.get("loaded"):
+            self._set("Bot", "News", "calendar not available - check internet", RED)
+        elif n.get("next"):
+            self._set("Bot", "News", f"next: {n['next']}")
+        else:
+            self._set("Bot", "News", "no high-impact news left this week")
+
     def _show_model(self, m: dict) -> None:
         if not m or not m.get("model"):
             self._set("Model", "Trained", "not yet")
             self._set("Model", "Status", "trains on first start")
+            self._set("Model", "Stop / target", "-")
             self._set("Model", "Thresholds", "-")
             self._set("Model", "Validation", "-")
             return
@@ -748,12 +835,13 @@ class App:
             self._set("Model", "Status", "SUSPENDED (losing)", RED)
         else:
             self._set("Model", "Status", "no edge - stays flat", AMBER)
+        self._set("Model", "Stop / target", m.get("geometry") or "-")
         tl, ts = m.get("thr_long"), m.get("thr_short")
         self._set("Model", "Thresholds", (f"long {tl:.2f}" if tl is not None else "long off") + " / "
                   + (f"short {ts:.2f}" if ts is not None else "short off"))
         v = m.get("validation") or {}
         if v.get("trades"):
-            self._set("Model", "Validation", f"{v['trades']} trades, {v['expectancy_r']:+.2f}R/trade, "
+            self._set("Model", "Validation", f"held-out: {v['trades']} trades, {v['expectancy_r']:+.2f}R/trade, "
                       f"PF {v['profit_factor']:.2f}, win {v['win_rate']:.0%}")
         else:
             self._set("Model", "Validation", "-")

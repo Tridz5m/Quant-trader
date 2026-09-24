@@ -4,14 +4,16 @@ What makes the bot "learn" on its own:
 
 1. It retrains on a rolling window of recent market data on a schedule, so
    it keeps adapting to the current gold regime.
-2. Every trade it actually took is fed back into training: the simulated
+2. It tries several stop/target/holding-time geometries and keeps the one
+   that works best on recent unseen data.
+3. Every trade it actually took is fed back into training: the simulated
    label for that bar is replaced by the real outcome (real fill, spread,
    slippage and management) and weighted more heavily.
-3. A new model (challenger) only replaces the running one (champion) if it
-   is at least as good on data neither of them was fitted on.
-4. If the champion starts losing out-of-sample and no better model can be
+4. A new model (challenger) only replaces the running one (champion) if it
+   is better on data neither of them was fitted on.
+5. If the champion starts losing out-of-sample and no better model can be
    found, trading is suspended until one is found.
-5. A losing streak in live trading triggers an early retrain.
+6. A losing streak in live trading triggers an early retrain.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import BotConfig
+from .config import BotConfig, Geometry
 from .features import WARMUP_BARS, build_features
 from .journal import Journal
 from .labeling import make_labels
@@ -36,18 +38,32 @@ CHAMPION_FILE = "champion.joblib"
 MIN_RETRY_HOURS = 1.0
 
 
-def build_dataset(bars: pd.DataFrame, cfg: BotConfig, point: float) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Features and labels for all bars after the indicator warm-up."""
+def build_dataset(bars: pd.DataFrame, cfg: BotConfig, point: float) -> tuple[pd.DataFrame, dict[Geometry, pd.DataFrame]]:
+    """Features, and labels for every candidate geometry, after the indicator warm-up."""
     feats = build_features(bars, point, cfg.strategy.atr_period, cfg.strategy.timeframe_minutes)
-    labels = make_labels(bars, point, cfg.strategy)
-    return feats.iloc[WARMUP_BARS:], labels.iloc[WARMUP_BARS:]
+    labels = {g: make_labels(bars, point, cfg.strategy, g).iloc[WARMUP_BARS:] for g in cfg.strategy.geometries()}
+    return feats.iloc[WARMUP_BARS:], labels
 
 
-def apply_live_feedback(labels: pd.DataFrame, trades: list[dict], weight: float) -> tuple[pd.DataFrame, np.ndarray]:
-    """Overwrite simulated labels with the outcome of trades really taken."""
-    labels = labels.copy()
-    weights = np.ones(len(labels))
-    pos = {ts: i for i, ts in enumerate(labels.index)}
+def trade_geometry(trade: dict, cfg: BotConfig) -> Geometry:
+    """Geometry a journaled trade was opened with (older trades used the base one)."""
+    if trade.get("sl_atr_mult") and trade.get("tp_atr_mult") and trade.get("horizon_bars"):
+        return Geometry(float(trade["sl_atr_mult"]), float(trade["tp_atr_mult"]), int(trade["horizon_bars"]))
+    return cfg.strategy.base_geometry
+
+
+def apply_live_feedback(
+    labels: dict[Geometry, pd.DataFrame], trades: list[dict], weight: float, cfg: BotConfig
+) -> tuple[dict[Geometry, pd.DataFrame], np.ndarray]:
+    """Overwrite simulated labels with the outcome of trades really taken.
+
+    A real outcome only replaces the label of the geometry it was traded
+    with; the bar gets a higher training weight either way.
+    """
+    labels = {g: L.copy() for g, L in labels.items()}
+    index = next(iter(labels.values())).index
+    weights = np.ones(len(index))
+    pos = {ts: i for i, ts in enumerate(index)}
     applied = 0
     for t in trades:
         if t.get("r_multiple") is None or not t.get("bar_time"):
@@ -55,10 +71,12 @@ def apply_live_feedback(labels: pd.DataFrame, trades: list[dict], weight: float)
         i = pos.get(pd.Timestamp(t["bar_time"]))
         if i is None:
             continue
-        side = "long" if t["direction"] > 0 else "short"
-        r = float(t["r_multiple"])
-        labels.iloc[i, labels.columns.get_loc(f"{side}_win")] = 1.0 if r > 0 else 0.0
-        labels.iloc[i, labels.columns.get_loc(f"{side}_r")] = r
+        L = labels.get(trade_geometry(t, cfg))
+        if L is not None:
+            side = "long" if t["direction"] > 0 else "short"
+            r = float(t["r_multiple"])
+            L.iloc[i, L.columns.get_loc(f"{side}_win")] = 1.0 if r > 0 else 0.0
+            L.iloc[i, L.columns.get_loc(f"{side}_r")] = r
         weights[i] = weight
         applied += 1
     if applied:
@@ -128,8 +146,9 @@ class SelfLearner:
 
         feats, labels = build_dataset(bars, self.cfg, point)
         if len(feats) > lc.train_bars:
-            feats, labels = feats.iloc[-lc.train_bars :], labels.iloc[-lc.train_bars :]
-        labels, weights = apply_live_feedback(labels, self.journal.closed_trades(), lc.live_trade_weight)
+            feats = feats.iloc[-lc.train_bars :]
+            labels = {g: L.iloc[-lc.train_bars :] for g, L in labels.items()}
+        labels, weights = apply_live_feedback(labels, self.journal.closed_trades(), lc.live_trade_weight, self.cfg)
         try:
             challenger = train_model(feats, labels, self.cfg.strategy, lc, sample_weight=weights)
         except InsufficientDataError as exc:
@@ -178,6 +197,7 @@ def describe_model(m) -> dict:
         "suspended": m.suspended,
         "thr_long": m.thr_long,
         "thr_short": m.thr_short,
+        "geometry": m.geometry.label if getattr(m, "geometry", None) is not None else None,
         "age_hours": round(m.age_hours(), 1),
         "validation": {k: m.metrics.get(k) for k in ("trades", "expectancy_r", "profit_factor", "win_rate")},
         "notes": list(getattr(m, "notes", []) or []),

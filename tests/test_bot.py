@@ -165,12 +165,22 @@ def test_live_feedback_overrides_labels(cfg, trend_bars):
     from quant_trader.learner import apply_live_feedback, build_dataset
 
     _, labels = build_dataset(trend_bars, cfg, 0.01)
-    t = labels.index[100]
-    trades = [{"bar_time": str(t), "direction": 1, "r_multiple": -0.8}]
-    new, w = apply_live_feedback(labels, trades, 3.0)
-    assert new.loc[t, "long_r"] == -0.8 and new.loc[t, "long_win"] == 0.0
-    assert w[100] == 3.0 and w.sum() == len(w) + 2.0
-    assert labels.loc[t, "long_r"] != -0.8  # original frame untouched
+    base, wide = cfg.strategy.geometries()[:2]
+    t1, t2 = labels[base].index[100], labels[base].index[200]
+    trades = [
+        # A trade from an older journal (no geometry columns) used the base geometry.
+        {"bar_time": str(t1), "direction": 1, "r_multiple": -0.8},
+        {"bar_time": str(t2), "direction": -1, "r_multiple": 1.2, "sl_atr_mult": wide.sl_atr_mult,
+         "tp_atr_mult": wide.tp_atr_mult, "horizon_bars": wide.horizon_bars},
+    ]
+    new, w = apply_live_feedback(labels, trades, 3.0, cfg)
+    assert new[base].loc[t1, "long_r"] == -0.8 and new[base].loc[t1, "long_win"] == 0.0
+    assert new[wide].loc[t2, "short_r"] == 1.2 and new[wide].loc[t2, "short_win"] == 1.0
+    # Each outcome only rewrites the geometry it was traded with.
+    assert new[wide].loc[t1, "long_r"] == labels[wide].loc[t1, "long_r"]
+    assert new[base].loc[t2, "short_r"] == labels[base].loc[t2, "short_r"]
+    assert w[100] == 3.0 and w[200] == 3.0 and w.sum() == len(w) + 4.0
+    assert labels[base].loc[t1, "long_r"] != -0.8  # original frames untouched
 
 
 def test_snapshot_published_for_the_app(cfg, noise_bars):
@@ -244,6 +254,44 @@ def test_run_once_scans_and_cleans_up(cfg, noise_bars):
     lock = InstanceLock(cfg.path(cfg.data_dir) / "bot.lock")
     assert lock.acquire()  # released again
     lock.release()
+
+
+def test_entry_uses_the_models_geometry_and_journals_it(cfg, noise_bars):
+    from quant_trader.config import Geometry
+
+    model = StubModel()
+    model.geometry = Geometry(4.0, 6.0, 12)
+    cfg.risk.min_lot_risk_tolerance = 10
+    bot, broker, journal = make_bot(cfg, noise_bars, model)
+    assert bot.run_cycle()["action"] == "open"
+    (pos,) = broker.positions()
+    atr = compute_atr(noise_bars).iloc[broker.i]
+    assert pos.sl == pytest.approx(broker.tick().ask - 4.0 * atr, abs=0.011)
+    assert pos.tp == pytest.approx(broker.tick().ask + 6.0 * atr, abs=0.011)
+    rec = journal.get_trade(pos.ticket)
+    assert (rec["sl_atr_mult"], rec["tp_atr_mult"], rec["horizon_bars"]) == (4.0, 6.0, 12)
+    # The trade is closed after its own 12-bar horizon, not the configured 36.
+    for _ in range(12):
+        broker.advance()
+        bot.run_cycle()
+        if journal.closed_trades():
+            break
+    (t,) = journal.closed_trades()
+    assert t["close_reason"] in ("time_exit", "sl", "tp")
+    assert broker.i - noise_bars.index.get_loc(pd.Timestamp(rec["bar_time"])) <= 12
+
+
+def test_stop_is_not_modified_again_when_it_would_not_move(cfg, noise_bars, monkeypatch):
+    import quant_trader.bot as botmod
+    from quant_trader.policy import ManageAction
+
+    bot, broker, _ = make_bot(cfg, noise_bars, StubModel())
+    assert bot.run_cycle()["action"] == "open"
+    (pos,) = broker.positions()
+    # The rule asks for a stop a hair above the current one; after rounding it is the same price.
+    monkeypatch.setattr(botmod, "manage_position", lambda *a, **k: ManageAction("modify", "breakeven", sl=pos.sl + 0.001))
+    bot._manage_positions(broker.positions(), broker.tick(), 1.0, broker.now(), noise_bars.index[broker.i], broker.spec)
+    assert not [x for x in broker.sent if x["action"] == "modify"]
 
 
 def test_frozen_tick_feed_is_treated_as_market_closed(cfg, noise_bars):

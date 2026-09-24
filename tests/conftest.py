@@ -12,6 +12,7 @@ def fast_config(tmp_path=None) -> BotConfig:
     cfg.learning.train_bars = 9000
     cfg.learning.max_iter = 60
     cfg.learning.min_samples_leaf = 100
+    cfg.news.enabled = False  # tests must not depend on this week's real news
     if tmp_path is not None:
         cfg.base_dir = str(tmp_path)
     return cfg
