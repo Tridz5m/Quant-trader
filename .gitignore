@@ -7,12 +7,14 @@ venv/
 build/
 dist/
 
-# Local settings and runtime state
-config.yaml
-data/
-logs/
-models/
-backtest_results/
+# Local settings and runtime state (top level only; tests/data holds fixtures)
+/config.yaml
+/config.old.yaml
+/data/
+/logs/
+/models/
+/backtest_results/
+/exports/
 
 # Build output
 selftest.log

@@ -1,0 +1,70 @@
+# Copy to config.yaml and adjust. Every key is optional; omitted keys use the
+# defaults shown here. Unknown keys are rejected (so typos can't disable limits).
+# All hours are BROKER SERVER TIME (the clock in MT5 Market Watch).
+
+dry_run: false            # true = log signals only, never send orders
+log_level: INFO
+
+mt5:
+  # Leave login/password/server empty to use the account already logged in
+  # in the terminal. Credentials can also come from the MT5_LOGIN,
+  # MT5_PASSWORD, MT5_SERVER and MT5_TERMINAL_PATH environment variables.
+  terminal_path: null     # e.g. "C:/Program Files/MetaTrader 5/terminal64.exe"
+  login: null
+  password: null
+  server: null
+  allow_real_account: false   # the bot refuses REAL accounts until you set this
+
+symbol:
+  name: XAUUSD            # broker variants (XAUUSDm, XAUUSD.a, GOLD) are auto-detected
+  magic: 26092401         # identifies this bot's orders
+  deviation_points: 30    # max slippage accepted on market orders
+  comment: QT-XAU
+
+schedule:
+  scan_interval_seconds: 300    # scan on every M5 candle close
+  bar_close_delay_seconds: 5
+  history_bars: 6000
+
+strategy:
+  sl_atr_mult: 1.5        # stop loss = 1.5 x ATR(14) on M5
+  tp_atr_mult: 2.25       # take profit = 2.25 x ATR  (1.5R)
+  horizon_bars: 36        # close after 3 hours if neither level is hit
+  slippage: 0.05          # cost allowance (price units) used in training/backtests
+  session_start_hour: 2   # no entries around the daily rollover
+  session_end_hour: 23
+  friday_last_entry_hour: 21
+  close_before_weekend: true
+  friday_close_hour: 23
+  max_spread: 0.80        # skip entries if spread (in $) is wider
+  max_spread_atr_frac: 0.35
+  max_bar_range_atr: 4.0  # skip after abnormal news candles
+  min_atr: 0.30
+  breakeven_at_r: 1.0     # move stop to entry +0.1R once 1R in profit (null = off)
+  breakeven_lock_r: 0.1
+  trailing_start_r: null  # e.g. 1.5 to trail the stop after 1.5R
+  trailing_atr_mult: 1.0
+
+risk:
+  risk_per_trade_pct: 0.5     # % of equity lost if the stop is hit
+  max_open_positions: 1
+  max_trades_per_day: 8
+  max_daily_loss_pct: 2.0     # stop for the day after this loss
+  max_drawdown_pct: 10.0      # kill switch (run `reset-halt` to resume)
+  max_consecutive_losses: 3
+  cooldown_minutes: 120
+  max_margin_usage_pct: 30.0
+  min_lot_risk_tolerance: 1.0 # >1 allows the broker minimum lot to exceed the risk budget
+  adaptive: true              # trade smaller / more selectively after losing streaks
+
+learning:
+  model_dir: models
+  train_bars: 40000           # ~5 months of M5 history per training run
+  retrain_every_hours: 24
+  retry_hours: 6
+  min_validation_trades: 30
+  min_validation_expectancy_r: 0.05
+  min_profit_factor: 1.10
+  min_t_stat: 2.0
+  min_auc: 0.52
+  live_trade_weight: 3.0      # real trades count 3x in the next training run
