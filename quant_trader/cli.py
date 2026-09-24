@@ -153,6 +153,7 @@ def cmd_backtest(cfg: BotConfig, args) -> int:
     from .backtest import format_stats, run_backtest
     from .broker.base import default_gold_spec
     from .features import prepare_bars
+    from .model import InsufficientDataError
 
     spec = default_gold_spec()
     if args.csv:
@@ -175,12 +176,21 @@ def cmd_backtest(cfg: BotConfig, args) -> int:
     bars = prepare_bars(raw, cfg.symbol.default_spread / spec.point)
     print(f"Backtesting {len(bars)} bars {bars.index[0]} -> {bars.index[-1]} "
           f"(retrain every {args.retrain_days} days)...")
-    res = run_backtest(
-        bars, cfg, spec,
-        retrain_every_bars=int(args.retrain_days * 276),
-        start_equity=args.equity,
-        commission_per_lot=args.commission,
-    )
+    try:
+        res = run_backtest(
+            bars, cfg, spec,
+            retrain_every_bars=int(args.retrain_days * 276),
+            start_equity=args.equity,
+            commission_per_lot=args.commission,
+        )
+    except InsufficientDataError as exc:
+        print(
+            f"\nNot enough history for a walk-forward backtest: {exc}.\n"
+            "In MT5 set Tools > Options > Charts > Max bars in chart to Unlimited, open an XAUUSD M5 chart\n"
+            "and hold the Home key until no more history loads, then run the backtest again.",
+            file=sys.stderr,
+        )
+        return 1
     print(format_stats(res.stats))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

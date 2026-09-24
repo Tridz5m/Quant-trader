@@ -60,7 +60,7 @@ the live bot, so the backtest measures what the live bot actually does.
 - **Windows** (the official `MetaTrader5` Python package is Windows-only; a
   Windows VPS is ideal for 24/5 running)
 - **MetaTrader 5** terminal installed and logged in to your broker
-- **Python 3.10 – 3.12, 64-bit**, from python.org (tick "Add to PATH")
+- **Python 3.10 – 3.14, 64-bit**, from python.org
 
 ## Setup
 
@@ -71,13 +71,16 @@ the live bot, so the backtest measures what the live bot actually does.
      at least 100000, so enough history is available for training.
    - Open an XAUUSD M5 chart once and scroll back so the terminal
      downloads history.
-2. **Install the bot**: double-click `setup_windows.bat`, or run manually:
+2. **Install the bot's Python packages** (once). Open a Command Prompt *in the
+   Quant-trader folder* (type `cmd` in the Explorer address bar) and run:
    ```bat
-   python -m venv .venv
-   .venv\Scripts\activate
-   pip install -r requirements.txt
+   py -m pip install -r requirements.txt
    copy config.example.yaml config.yaml
    ```
+   `py` is the Python launcher that python.org installs. Use the same command
+   (`py` or `python`) to install and to run the bot, so both use the same Python.
+   Alternatively, double-click `setup_windows.bat` to install into an isolated
+   `.venv` folder (then `run_bot.bat` uses it automatically).
 3. **Configure** `config.yaml`. The defaults are sensible; the main settings
    are `risk.risk_per_trade_pct` and the session hours. Leave the `mt5`
    login fields empty to use the account already logged in in the terminal,
@@ -88,25 +91,25 @@ the live bot, so the backtest measures what the live bot actually does.
 
 ```bat
 :: 1. See how the full self-learning system would have traded your broker's data
-python -m quant_trader backtest
+py -m quant_trader backtest
 
 :: 2. Train now (otherwise the bot trains automatically on first start)
-python -m quant_trader train
+py -m quant_trader train
 
 :: 3. Watch it think without sending orders
-python -m quant_trader run --dry-run
+py -m quant_trader run --dry-run
 
 :: 4. Trade autonomously (demo first!). Or double-click run_bot.bat,
 ::    which restarts the bot automatically if it ever crashes.
-python -m quant_trader run
+py -m quant_trader run
 
 :: Other commands
-python -m quant_trader run --once       & rem one scan, then exit
-python -m quant_trader status           & rem model, risk state, trades, open positions
-python -m quant_trader download --bars 100000 --out data\xauusd_m5.csv
-python -m quant_trader backtest --csv data\xauusd_m5.csv --retrain-days 5 --commission 7
-python -m quant_trader backtest --synthetic   & rem pipeline demo, no MT5 needed
-python -m quant_trader reset-halt       & rem clear the drawdown kill switch
+py -m quant_trader run --once       & rem one scan, then exit
+py -m quant_trader status           & rem model, risk state, trades, open positions
+py -m quant_trader download --bars 100000 --out data\xauusd_m5.csv
+py -m quant_trader backtest --csv data\xauusd_m5.csv --retrain-days 5 --commission 7
+py -m quant_trader backtest --synthetic   & rem pipeline demo, no MT5 needed
+py -m quant_trader reset-halt       & rem clear the drawdown kill switch
 ```
 
 Stop the bot with **Ctrl+C**. Open trades keep their stop-loss and
@@ -178,11 +181,22 @@ quant_trader/
 tests/            unit and integration tests (run anywhere, no MT5 needed)
 ```
 
+## Troubleshooting
+
+| Message | Fix |
+|---|---|
+| `No module named 'yaml'` (or numpy, pandas, sklearn) / `Missing Python packages` | The packages aren't installed for the Python you ran. In the Quant-trader folder run `py -m pip install -r requirements.txt` (the bot prints the exact command for your Python). |
+| `MetaTrader5 package is not installed` / pip can't find `MetaTrader5` | MetaTrader5 exists only for **64-bit Windows Python 3.10 – 3.14**. Install that from python.org, then repeat the pip command. |
+| `Could not connect to MetaTrader 5` | Open the MT5 terminal and log in. With several terminals installed, set `mt5.terminal_path` in `config.yaml`. |
+| `Not enough history for a walk-forward backtest` | In MT5 set *Tools → Options → Charts → Max bars in chart* to Unlimited, open an XAUUSD M5 chart and hold **Home** until no more history loads. |
+| `Algo Trading is disabled` | Click the **Algo Trading** button in the MT5 toolbar (it turns green). |
+| `NOT TRADEABLE` after training | Not an error: no statistically reliable edge was found in recent data, so the bot stays flat and retries later. |
+
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
-python -m pytest
+py -m pip install -r requirements-dev.txt
+py -m pytest
 ```
 
 The tests run on Linux/macOS too: a simulated broker replays synthetic gold

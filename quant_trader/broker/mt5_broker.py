@@ -7,6 +7,7 @@ config) and the "Algo Trading" button must be enabled.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -78,8 +79,8 @@ def _import_mt5():
         import MetaTrader5 as mt5  # type: ignore
     except ImportError as exc:  # pragma: no cover - platform specific
         raise BrokerError(
-            "The MetaTrader5 package is not installed. It only works on Windows "
-            "with the MT5 terminal installed: pip install MetaTrader5"
+            "The MetaTrader5 package is not installed (it exists for 64-bit Windows Python only). "
+            f'Install it with: "{sys.executable}" -m pip install MetaTrader5'
         ) from exc
     return mt5
 
@@ -112,7 +113,11 @@ class MT5Broker(Broker):
             if self.cfg.server:
                 kwargs["server"] = self.cfg.server
         if not self.mt5.initialize(**kwargs):
-            raise self._err("mt5.initialize")
+            raise BrokerError(
+                f"Could not connect to MetaTrader 5 {self.mt5.last_error()}. Make sure the MT5 terminal is "
+                "open and logged in to your account. If several terminals are installed, set "
+                "mt5.terminal_path in config.yaml."
+            )
         self.symbol = self._resolve_symbol(self.sym_cfg.name)
         if not self.mt5.symbol_select(self.symbol, True):
             raise self._err(f"symbol_select({self.symbol})")
@@ -195,14 +200,17 @@ class MT5Broker(Broker):
 
     def rates(self, count: int) -> pd.DataFrame:
         tf = self.c("TIMEFRAME_M5")
+        # The terminal serves at most "Max bars in chart" bars (incl. the forming one).
+        info = self.mt5.terminal_info()
+        maxbars = getattr(info, "maxbars", 0) if info is not None else 0
+        n = min(count, maxbars - 1) if maxbars > 1 else count
         arr = None
-        n = count
         while n >= 500:
             # start_pos=1 skips the candle that is still forming.
             arr = self.mt5.copy_rates_from_pos(self.symbol, tf, 1, n)
             if arr is not None and len(arr) > 0:
                 break
-            n //= 2
+            n = int(n * 0.7)
         if arr is None or len(arr) == 0:
             raise self._err("copy_rates_from_pos")
         df = pd.DataFrame(arr)

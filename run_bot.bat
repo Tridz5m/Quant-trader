@@ -1,9 +1,14 @@
 @echo off
 REM Start the XAUUSD bot. Keep this window open; press Ctrl+C to stop.
 cd /d "%~dp0"
-if exist .venv\Scripts\activate.bat call .venv\Scripts\activate.bat
+
+REM Prefer the project's virtual environment, then the "py" launcher, then "python".
+set "PY=python"
+where py >nul 2>nul && set "PY=py"
+if exist .venv\Scripts\python.exe set "PY=.venv\Scripts\python.exe"
+
 :loop
-python -m quant_trader run
+%PY% -m quant_trader run
 if %ERRORLEVEL%==2 (
   echo Fix the error above, then start again.
   pause

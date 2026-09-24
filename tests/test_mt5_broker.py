@@ -29,6 +29,8 @@ class FakeMT5:
         self.symbols = {s.name: s for s in symbols}
         self.requests = []
         self.rejected_fillings = set()
+        self.available_bars = 1000
+        self.maxbars = 0
         self.positions = []
         self.deals = []
 
@@ -52,7 +54,7 @@ class FakeMT5:
         return name in self.symbols
 
     def terminal_info(self):
-        return NS(name="Fake MT5", connected=True, trade_allowed=True)
+        return NS(name="Fake MT5", connected=True, trade_allowed=True, maxbars=self.maxbars)
 
     def account_info(self):
         return NS(login=7, server="Demo", balance=1000.0, equity=1010.0, margin_free=900.0, currency="USD",
@@ -64,7 +66,9 @@ class FakeMT5:
     def copy_rates_from_pos(self, symbol, tf, start, count):
         dtype = [("time", "i8"), ("open", "f8"), ("high", "f8"), ("low", "f8"), ("close", "f8"),
                  ("tick_volume", "i8"), ("spread", "i4"), ("real_volume", "i8")]
-        n = min(count, 1000)
+        if self.maxbars and start + count > self.maxbars:
+            return None  # the real terminal refuses requests beyond "Max bars in chart"
+        n = min(count, self.available_bars)
         arr = np.zeros(n, dtype=dtype)
         arr["time"] = T0 - 300 * np.arange(n, 0, -1)
         arr["open"] = arr["close"] = 2650.0
@@ -133,6 +137,13 @@ def test_rates_frame(monkeypatch):
     assert list(df.columns) == ["open", "high", "low", "close", "tick_volume", "spread"]
     assert isinstance(df.index, pd.DatetimeIndex) and df.index.is_monotonic_increasing
     assert df.index[-1] == pd.Timestamp(T0 - 300, unit="s")
+
+
+def test_rates_request_is_capped_at_terminal_max_bars(monkeypatch):
+    broker, fake = make_broker(monkeypatch, [gold("XAUUSD")])
+    broker.connect()
+    fake.available_bars, fake.maxbars = 50_000, 3000
+    assert len(broker.rates(100_000)) == 2999
 
 
 def test_market_order_falls_back_to_supported_filling(monkeypatch):
