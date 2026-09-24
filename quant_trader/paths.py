@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -12,13 +13,30 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def writable(folder: Path) -> bool:
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / ".quant_trader_write_test"
+        probe.write_text("ok")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
 def app_home() -> Path:
     """Folder for config.yaml, data, logs and models.
 
-    The packaged exe keeps everything next to itself; from source it is the
-    current directory (the Quant-trader folder).
+    The packaged exe keeps everything next to itself, or in
+    %LOCALAPPDATA%\\QuantTrader when its folder is read-only (e.g. Program
+    Files). From source it is the current directory (the Quant-trader folder).
     """
-    return Path(sys.executable).resolve().parent if is_frozen() else Path.cwd()
+    if not is_frozen():
+        return Path.cwd()
+    home = Path(sys.executable).resolve().parent
+    if writable(home):
+        return home
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "QuantTrader"
 
 
 def resource(relative: str) -> Path:

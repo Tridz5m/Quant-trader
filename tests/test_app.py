@@ -145,6 +145,8 @@ def test_desktop_app_runs_the_bot(tmp_path, monkeypatch, trend_bars):
         assert (tmp_path / "logs" / "bot.log").exists()
     finally:
         app._closing = True
+        if app._journal is not None:
+            app._journal.close()  # Windows cannot delete an open database file
         root.destroy()
         rootlog = logging.getLogger()
         for h in rootlog.handlers[:]:
@@ -155,3 +157,18 @@ def test_desktop_app_runs_the_bot(tmp_path, monkeypatch, trend_bars):
             if h not in rootlog.handlers:
                 rootlog.addHandler(h)
         rootlog.setLevel(saved[1])
+
+
+def test_app_home_falls_back_when_exe_folder_is_read_only(tmp_path, monkeypatch):
+    import sys
+
+    from quant_trader import paths
+
+    exe_dir = tmp_path / "Program Files" / "QuantTrader"
+    exe_dir.mkdir(parents=True)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe_dir / "QuantTrader.exe"))
+    assert paths.app_home() == exe_dir
+    monkeypatch.setattr(paths, "writable", lambda folder: folder != exe_dir)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    assert paths.app_home() == tmp_path / "LocalAppData" / "QuantTrader"

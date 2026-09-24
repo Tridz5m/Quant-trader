@@ -66,7 +66,8 @@ The easiest way to run the bot: one file, nothing else to install.
    click the latest green run and download **QuantTrader.exe** under
    *Artifacts* (or from **Releases**, once a version is published).
 2. **Put it in its own folder**, e.g. `C:\QuantTrader\`. The app keeps its
-   settings (`config.yaml`), trade journal, logs and models next to the exe.
+   settings (`config.yaml`), trade journal, logs and models next to the exe
+   (or in `%LOCALAPPDATA%\QuantTrader` if that folder is read-only).
 3. **Double-click it.** Windows may show *"Windows protected your PC"*
    because the exe isn't code-signed: click *More info → Run anyway*. The
    first launch takes a few seconds while it unpacks.

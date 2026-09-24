@@ -977,6 +977,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _set_icon(root)
         App(root, home)
+    except Exception as exc:  # a windowed exe has no console: always explain
+        from tkinter import messagebox
+
+        _close_splash()
+        root.withdraw()
+        messagebox.showerror(APP_NAME, f"{APP_NAME} could not start:\n\n{type(exc).__name__}: {exc}\n\nFolder: {home}")
+        root.destroy()
+        return 1
     finally:
         _close_splash()
     root.mainloop()
