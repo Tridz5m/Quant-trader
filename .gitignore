@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Local settings and runtime state
+config.yaml
+data/
+logs/
+models/
+backtest_results/

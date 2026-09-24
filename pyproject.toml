@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-trader"
+version = "1.0.0"
+description = "Self-learning XAUUSD trading bot for MetaTrader 5"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "MetaTrader5>=5.0.45; platform_system == 'Windows'",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+quant-trader = "quant_trader.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["quant_trader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
