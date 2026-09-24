@@ -24,18 +24,18 @@ symbol:
 schedule:
   scan_interval_seconds: 300    # scan on every M5 candle close
   bar_close_delay_seconds: 5
-  history_bars: 20000           # ~70 days, so the daily trend is known
+  history_bars: 6000
 
 strategy:
-  # Wide stops lose far less of each trade to spread and M5 noise. On real
-  # XAUUSD history, tighter stops (1.5 or 2.5 x ATR) lost money.
-  sl_atr_mult: 4.0        # stop loss = 4 x ATR(14) on M5
-  tp_atr_mult: 6.0        # take profit = 6 x ATR (1.5R)
-  horizon_bars: 144       # close after 12 hours if neither level is hit
-  # Other [stop x ATR, target x ATR, max bars held] the learner may use
-  # instead, whichever works best on recent unseen data. [] = none.
-  candidate_geometries: []
-  trend_filter: true      # buy only in a daily uptrend, sell only in a downtrend
+  sl_atr_mult: 1.5        # stop loss = 1.5 x ATR(14) on M5
+  tp_atr_mult: 2.25       # take profit = 2.25 x ATR  (1.5R)
+  horizon_bars: 36        # close after 3 hours if neither level is hit
+  # Wider alternatives the learner may pick instead, whichever works best on
+  # recent unseen data: [stop x ATR, target x ATR, max bars held].
+  # Wider stops lose relatively less to spread and noise. [] = never.
+  candidate_geometries:
+    - [2.5, 3.75, 72]     # 6 hours
+    - [4.0, 6.0, 144]     # 12 hours
   slippage: 0.05          # cost allowance (price units) used in training/backtests
   session_start_hour: 2   # no entries around the daily rollover
   session_end_hour: 23
@@ -75,14 +75,14 @@ news:
 
 learning:
   model_dir: models
-  train_bars: 60000           # ~7 months of M5 history per training run
+  train_bars: 40000           # ~5 months of M5 history per training run
   retrain_every_hours: 24
   retry_hours: 6
-  # Quality gates, measured on the newest ~7 weeks of held-out data, which
-  # were not used to choose the model's thresholds or stop/target geometry.
+  # Quality gates, measured on held-out data that was not used to choose the
+  # model's thresholds or stop/target geometry.
   min_validation_trades: 20
   min_validation_expectancy_r: 0.05
   min_profit_factor: 1.10
-  min_t_stat: 1.5
+  min_t_stat: 2.0
   min_auc: 0.52
   live_trade_weight: 3.0      # real trades count 3x in the next training run

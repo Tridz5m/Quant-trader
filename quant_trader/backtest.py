@@ -36,7 +36,11 @@ class BacktestResult:
 
 @dataclass
 class Signals:
-    """Out-of-sample model output and trade geometry for every bar."""
+    """Out-of-sample model output and trade geometry for every bar.
+
+    ``p_long``/``p_short`` are NaN where no model trades or the side is
+    blocked by the daily trend filter.
+    """
 
     p_long: np.ndarray
     p_short: np.ndarray
@@ -91,7 +95,7 @@ def walk_forward_signals(bars: pd.DataFrame, cfg: BotConfig, point: float, retra
         e = min(s + retrain_every_bars, n)
         trading = bool(champion is not None and champion.tradeable)
         if trading:
-            pl, ps = champion.predict(feats.iloc[s:e])
+            pl, ps = champion.signals(feats.iloc[s:e])
             sig.p_long[s:e], sig.p_short[s:e] = pl, ps
             sig.thr_long[s:e], sig.thr_short[s:e] = champion.thresholds()
             g = champion.geometry or sc.base_geometry
@@ -209,7 +213,7 @@ def simulate(
                 else:
                     pos["sl"] = act.sl
 
-        if pos is None and math.isfinite(p_long[i]):
+        if pos is None and (math.isfinite(p_long[i]) or math.isfinite(p_short[i])):
             eq = balance
             mult, bump = rm.adaptive(recent_r, state, eq)
             d = decide(p_long[i], p_short[i], thr_long[i] + bump, thr_short[i] + bump)

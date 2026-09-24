@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 from quant_trader.learner import build_dataset
-from quant_trader.model import QuantileBinner, TrainedModel, choose_champion, train_model
+from quant_trader.model import QuantileBinner, TrainedModel, choose_champion, train_model, trend_filter_probs
 
 
 def test_learns_a_real_edge_and_round_trips(trend_bars, cfg, tmp_path):
@@ -113,3 +113,35 @@ def test_model_incompatible_when_its_geometry_is_no_longer_allowed(trend_bars, c
     cfg.strategy.candidate_geometries = []
     cfg.strategy.sl_atr_mult = 9.0
     assert not model.is_compatible(cfg.strategy)
+
+
+def test_trend_filter_blanks_the_side_against_the_trend():
+    f = pd.DataFrame({"d1_trend": [1.0, -1.0, np.nan, 0.0]})
+    pl, ps = np.full(4, 0.9), np.full(4, 0.8)
+    fl, fs = trend_filter_probs(pl, ps, f, True)
+    assert fl[0] == 0.9 and np.isnan(fl[1:]).all()
+    assert fs[1] == 0.8 and np.isnan(fs[[0, 2, 3]]).all()
+    same = trend_filter_probs(pl, ps, f, False)
+    assert same[0] is pl and same[1] is ps
+
+
+def test_model_with_trend_filter_only_signals_with_the_trend(trend_bars, cfg):
+    cfg.strategy.trend_filter = True
+    feats, labels = build_dataset(trend_bars, cfg, 0.01)
+    model = train_model(feats, labels, cfg.strategy, cfg.learning)
+    assert model.trend_filter and model.is_compatible(cfg.strategy)
+    cfg.strategy.trend_filter = False
+    assert not model.is_compatible(cfg.strategy)  # retrained when the setting changes
+    pl, ps = model.signals(feats)
+    trend = feats["d1_trend"].to_numpy()
+    assert np.isnan(pl[~(trend > 0)]).all() and np.isnan(ps[~(trend < 0)]).all()
+    assert np.isfinite(pl[trend > 0]).all() and np.isfinite(ps[trend < 0]).all()
+
+
+def test_features_without_values_are_left_out_of_training(trend_bars, cfg):
+    feats, labels = build_dataset(trend_bars, cfg, 0.01)
+    feats = feats.assign(empty=np.nan)
+    model = train_model(feats, labels, cfg.strategy, cfg.learning)
+    assert "empty" not in model.binner.columns
+    pl, _ = model.predict(feats.iloc[-10:])
+    assert np.isfinite(pl).all()

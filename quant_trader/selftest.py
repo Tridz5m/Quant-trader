@@ -25,8 +25,9 @@ def _fast_config(base_dir: str):
     cfg.learning.train_bars = 9000
     cfg.learning.max_iter = 60
     cfg.learning.min_samples_leaf = 100
-    cfg.schedule.history_bars = 6000
     cfg.news.enabled = False
+    # Synthetic trends last hours, not weeks, so the daily trend filter would only thin out trades.
+    cfg.strategy.trend_filter = False
     return cfg
 
 

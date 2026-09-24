@@ -13,7 +13,7 @@ import pandas as pd
 
 from .broker.base import LONG, Broker, BrokerError, Position, SymbolSpec, Tick
 from .config import BotConfig
-from .features import WARMUP_BARS, build_features, compute_atr, prepare_bars
+from .features import LIVE_HISTORY_BARS, TREND_COLUMN, WARMUP_BARS, build_features, compute_atr, prepare_bars
 from .instance import InstanceLock
 from .journal import Journal
 from .learner import SelfLearner
@@ -192,7 +192,9 @@ class TradingBot:
         spec = self.broker.symbol_spec()
         tick = self.broker.tick()
         now = tick.time
-        bars = prepare_bars(self.broker.rates(self.cfg.schedule.history_bars), self._default_spread_points(spec))
+        # Enough history for the daily trend (30+ days), whatever the config says.
+        n_bars = max(self.cfg.schedule.history_bars, LIVE_HISTORY_BARS)
+        bars = prepare_bars(self.broker.rates(n_bars), self._default_spread_points(spec))
         last_bar = bars.index[-1]
         report["bar_time"] = last_bar
 
@@ -215,6 +217,7 @@ class TradingBot:
             return report
 
         feats = build_features(bars, spec.point, self.cfg.strategy.atr_period, self.cfg.strategy.timeframe_minutes)
+        report["trend"] = float(feats[TREND_COLUMN].iloc[-1])
         atr_now = float(compute_atr(bars, self.cfg.strategy.atr_period).iloc[-1])
         positions = self.broker.positions()
         self._manage_positions(positions, tick, atr_now, now, last_bar, spec)
@@ -284,11 +287,12 @@ class TradingBot:
         row = feats.iloc[[-1]]
         pl, ps = model.predict(row)
         p_long, p_short = float(pl[0]), float(ps[0])
+        fl, fs = model.signals(row)  # minus the side against the daily trend
         account = self.broker.account()
         recent = self.journal.recent_r(self.cfg.risk.adaptive_window)
         risk_mult, bump = self.risk.adaptive(recent, self.state, account.equity)
         thr_l, thr_s = model.thresholds(bump)
-        direction = decide(p_long, p_short, thr_l, thr_s)
+        direction = decide(float(fl[0]), float(fs[0]), thr_l, thr_s)
         report.update(p_long=p_long, p_short=p_short, thr_long=thr_l, thr_short=thr_s, direction=direction)
 
         spread = tick.ask - tick.bid
@@ -302,6 +306,12 @@ class TradingBot:
         news = self.news.blackout(self._utc_now()) if direction != 0 else None
         if direction == 0:
             reason = "no signal"
+            if decide(p_long, p_short, thr_l, thr_s) != 0:
+                trend = report.get("trend", math.nan)
+                reason = (
+                    "signal against the daily trend" if math.isfinite(trend)
+                    else "daily trend not known yet (needs 30+ days of M5 history)"
+                )
         elif news is not None:
             reason = f"high-impact news: {news.describe()}"
         else:
@@ -332,7 +342,7 @@ class TradingBot:
             return
 
         side = "BUY" if direction == LONG else "SELL"
-        desc = f"{side} {volume:.2f} {spec.name} @ {entry_ref:.2f} SL {sl:.2f} TP {tp:.2f} (p={max(p_long, p_short):.2f})"
+        desc = f"{side} {volume:.2f} {spec.name} @ {entry_ref:.2f} SL {sl:.2f} TP {tp:.2f} (p={p_long if direction == LONG else p_short:.2f})"
         if self.cfg.dry_run:
             report.update(action="dry_run", reason=desc)
             self.journal.log_signal(**signal_row, action="dry_run", reason=desc)

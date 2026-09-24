@@ -25,7 +25,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
 
 from .config import Geometry, LearningConfig, StrategyConfig
-from .features import FEATURE_VERSION
+from .features import FEATURE_VERSION, TREND_COLUMN
 from .policy import LONG, SHORT, decide_vec, simulate_policy, trade_stats
 
 log = logging.getLogger(__name__)
@@ -49,7 +49,24 @@ def strategy_signature(scfg: StrategyConfig) -> dict[str, Any]:
         "feature_version": FEATURE_VERSION,
         "atr_period": scfg.atr_period,
         "timeframe_minutes": scfg.timeframe_minutes,
+        "trend_filter": bool(scfg.trend_filter),
     }
+
+
+def trend_filter_probs(
+    p_long: np.ndarray, p_short: np.ndarray, features: pd.DataFrame, enabled: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Blank out (NaN = no trade) the side that goes against the daily trend.
+
+    While the trend is unknown both sides are blanked.
+    """
+    if not enabled:
+        return p_long, p_short
+    if TREND_COLUMN in features.columns:
+        trend = features[TREND_COLUMN].to_numpy(dtype=float)
+    else:
+        trend = np.full(len(features), np.nan)
+    return np.where(trend > 0, p_long, np.nan), np.where(trend < 0, p_short, np.nan)
 
 
 @dataclass
@@ -86,6 +103,15 @@ class TrainedModel:
         pl = self.long_model.predict_proba(X)[:, 1] if self.long_model is not None else np.zeros(n)
         ps = self.short_model.predict_proba(X)[:, 1] if self.short_model is not None else np.zeros(n)
         return pl, ps
+
+    @property
+    def trend_filter(self) -> bool:
+        return bool(self.signature.get("trend_filter", False))
+
+    def signals(self, features: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        """Probabilities to trade on: :meth:`predict` minus the side against the daily trend."""
+        pl, ps = self.predict(features)
+        return trend_filter_probs(pl, ps, features, self.trend_filter)
 
     def is_compatible(self, scfg: StrategyConfig) -> bool:
         return self.signature == strategy_signature(scfg) and self.geometry in scfg.geometries()
@@ -222,7 +248,7 @@ def evaluate_model(model: TrainedModel, features: pd.DataFrame, labels: pd.DataF
     """Out-of-sample trade statistics of ``model`` on the given rows."""
     if len(features) == 0:
         return trade_stats(np.array([]))
-    pl, ps = model.predict(features)
+    pl, ps = model.signals(features)
     tl, ts = model.thresholds(bump)
     direction = decide_vec(pl, ps, tl, ts)
     rs, _ = simulate_policy(
@@ -309,8 +335,11 @@ def train_model(
         raise InsufficientDataError("not enough data for a train/tune/test split")
 
     w = w_all * recency_weights(n, lcfg.recency_half_life_bars)
-    binner = QuantileBinner().fit(X.iloc[:tr_end])
-    B_tr, B_tune, B_test = (binner.transform(X.iloc[part]) for part in (slice(0, tr_end), tune, test))
+    # A feature with no values yet (daily indicators early in the history) can't be learned from.
+    usable = [c for c in X.columns if X[c].iloc[:tr_end].notna().any()]
+    binner = QuantileBinner().fit(X.iloc[:tr_end][usable])
+    X_tune, X_test = X.iloc[tune], X.iloc[test]
+    B_tr, B_tune, B_test = binner.transform(X.iloc[:tr_end]), binner.transform(X_tune), binner.transform(X_test)
     w_tr = w[:tr_end]
 
     cands = []
@@ -324,6 +353,9 @@ def train_model(
         # AUC involves no threshold, so tune + test together stays an honest estimate.
         auc_l = _auc(np.concatenate([L_tune["long_win"].to_numpy(), L_test["long_win"].to_numpy()]), np.concatenate([pl_tu, pl_te]))
         auc_s = _auc(np.concatenate([L_tune["short_win"].to_numpy(), L_test["short_win"].to_numpy()]), np.concatenate([ps_tu, ps_te]))
+        # Thresholds and gates see only the trades the bot would really take.
+        pl_tu, ps_tu = trend_filter_probs(pl_tu, ps_tu, X_tune, scfg.trend_filter)
+        pl_te, ps_te = trend_filter_probs(pl_te, ps_te, X_test, scfg.trend_filter)
         thr_l, info_l = select_threshold(pl_tu, L_tune["long_r"].to_numpy(), L_tune["long_exit"].to_numpy(), LONG, lcfg)
         thr_s, info_s = select_threshold(ps_tu, L_tune["short_r"].to_numpy(), L_tune["short_exit"].to_numpy(), SHORT, lcfg)
         # A side whose model cannot rank outcomes is noise, whatever its best threshold says.
@@ -392,7 +424,7 @@ def train_model(
     if lcfg.refit_on_full_data:
         # Use the most recent data too; thresholds and geometry come from the split above.
         L = Ls[geometry]
-        binner_full = QuantileBinner().fit(X)
+        binner_full = QuantileBinner().fit(X[usable])
         B = binner_full.transform(X)
         long_full = _fit(B, L["long_win"].to_numpy(), w, lcfg)
         short_full = _fit(B, L["short_win"].to_numpy(), w, lcfg)

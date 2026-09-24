@@ -23,6 +23,7 @@ import pandas as pd
 from . import services
 from .config import BotConfig, ConfigError, load_config
 from .logsetup import setup_logging
+from .paths import upgrade_config
 
 log = logging.getLogger("quant_trader")
 
@@ -156,12 +157,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "app":
         return cmd_app(None, args)
+    config_path = Path(args.config)
+    upgraded = upgrade_config(config_path.parent) if config_path.name == "config.yaml" else []
     try:
         cfg = load_config(args.config)
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         return EXIT_FATAL
     setup_logging(cfg, "bot" if args.cmd == "run" else args.cmd)
+    if upgraded:
+        log.info("config.yaml updated to the new defaults (%s). Previous file saved as config.old.yaml.",
+                 "; ".join(upgraded))
     handlers = {
         "run": cmd_run,
         "train": cmd_train,

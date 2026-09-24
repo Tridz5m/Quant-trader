@@ -54,7 +54,8 @@ class ScheduleConfig:
     scan_interval_seconds: int = 300
     # Wait a few seconds after the M5 candle closes so the bar is final.
     bar_close_delay_seconds: int = 5
-    history_bars: int = 6000
+    # M5 bars loaded each scan (at least ~70 days so the daily trend is known).
+    history_bars: int = 20_000
     stale_data_minutes: int = 15
 
 
@@ -75,16 +76,22 @@ class Geometry:
 class StrategyConfig:
     timeframe_minutes: int = 5
     atr_period: int = 14
-    sl_atr_mult: float = 1.5
-    tp_atr_mult: float = 2.25
-    horizon_bars: int = 36
+    # Stop, target and maximum holding time. Wide stops pay relatively little
+    # spread and noise; on real XAUUSD history 1.5 and 2.5 x ATR stops lost.
+    sl_atr_mult: float = 4.0
+    tp_atr_mult: float = 6.0
+    horizon_bars: int = 144
     # Extra [stop x ATR, target x ATR, max bars] combinations the learner may
-    # use instead of the one above, whichever works best on unseen data. Wider
-    # stops pay relatively less spread and noise. [] = always use the above.
-    candidate_geometries: list = field(default_factory=lambda: [[2.5, 3.75, 72], [4.0, 6.0, 144]])
+    # use instead of the one above, whichever works best on unseen data.
+    # [] = always use the above.
+    candidate_geometries: list = field(default_factory=list)
     # Round-trip slippage/commission allowance in price units, used in labels
     # and backtests so the model learns from realistic outcomes.
     slippage: float = 0.05
+    # Only buy in a daily uptrend and only sell in a downtrend (10- vs 30-day
+    # EMA of daily closes). On real XAUUSD history, signals against this
+    # trend lost money for every stop size and in every period tested.
+    trend_filter: bool = True
     # Entry window in server hours: start <= hour < end.
     session_start_hour: float = 2.0
     session_end_hour: float = 23.0
@@ -139,12 +146,13 @@ class RiskConfig:
 @dataclass
 class LearningConfig:
     model_dir: str = "models"
-    train_bars: int = 40_000
+    # ~7 months of M5 bars per training run.
+    train_bars: int = 60_000
     min_train_bars: int = 8_000
     # The newest part of the training window is held out. Its first half picks
-    # the confidence thresholds and stop geometry; the second half, never used
-    # for any choice, decides whether the model may trade.
-    validation_fraction: float = 0.30
+    # the confidence thresholds and stop geometry; the second half (~7 weeks),
+    # never used for any choice, decides whether the model may trade.
+    validation_fraction: float = 0.45
     retrain_every_hours: float = 24.0
     # When no tradeable model exists, retry training this often.
     retry_hours: float = 6.0
@@ -158,7 +166,9 @@ class LearningConfig:
     min_validation_expectancy_r: float = 0.05
     min_profit_factor: float = 1.10
     # Expectancy t-statistic (mean / std * sqrt(trades)) on held-out trades.
-    min_t_stat: float = 2.0
+    # With wide stops a false alarm costs little, while 2.0 kept the bot out
+    # of the market almost all the time on real XAUUSD history.
+    min_t_stat: float = 1.5
     # A side is only enabled if its model ranks outcomes better than chance.
     min_auc: float = 0.52
     threshold_min: float = 0.30
@@ -280,7 +290,8 @@ def validate(cfg: BotConfig) -> None:
          "strategy.candidate_geometries must be a list of up to 4 [stop, target, bars] entries with positive values"),
         (s.timeframe_minutes == 5, "strategy.timeframe_minutes must be 5 (M5 scanning)"),
         (0 <= s.session_start_hour < s.session_end_hour <= 24, "invalid session hours"),
-        (0.05 <= lc.validation_fraction <= 0.5, "learning.validation_fraction must be in [0.05, 0.5]"),
+        # The training part must stay at least as large as the held-out part.
+        (0.05 <= lc.validation_fraction <= 0.45, "learning.validation_fraction must be in [0.05, 0.45]"),
         (lc.threshold_min < lc.threshold_max, "learning.threshold_min must be < threshold_max"),
         (lc.min_train_bars >= 1000, "learning.min_train_bars must be >= 1000"),
         (cfg.schedule.scan_interval_seconds >= 60, "schedule.scan_interval_seconds must be >= 60"),
@@ -310,14 +321,17 @@ def _yaml_scalar(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, float):
         return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_yaml_scalar(v) for v in value) + "]"
     return str(value)
 
 
-def set_config_value(path: str | Path, section: str, key: str, value: Any) -> None:
+def set_config_value(path: str | Path, section: str, key: str, value: Any, comment: str | None = None) -> None:
     """Set ``section.key`` in a YAML config file, keeping comments and layout.
 
-    The result is validated; on an invalid value the file is left unchanged
-    and :class:`ConfigError` is raised.
+    ``comment`` replaces the key's end-of-line comment ("" removes it);
+    by default the existing comment is kept. The result is validated; on an
+    invalid value the file is left unchanged and :class:`ConfigError` is raised.
     """
     path = Path(path)
     # Read raw bytes: read_text() would silently turn Windows line endings into "\n".
@@ -339,24 +353,92 @@ def set_config_value(path: str | Path, section: str, key: str, value: Any) -> No
         if section_at is not None:
             m = key_re.match(body)
             if m:
-                indent, space, old_val, comment = m.groups()
-                shown = new_val.ljust(len(old_val)) if comment else new_val
-                lines[i] = f"{indent}{key}:{space or ' '}{shown}{comment or ''}{ending}"
+                indent, space, old_val, old_comment = m.groups()
+                if comment is None:
+                    shown = new_val.ljust(len(old_val)) if old_comment else new_val
+                    text = f"{indent}{key}:{space or ' '}{shown}{old_comment or ''}"
+                else:
+                    text = f"{indent}{key}:{space or ' '}{new_val}"
+                    if comment:
+                        column = len(body) - len(old_comment.lstrip()) if old_comment else 0
+                        text = text.ljust(max(column, len(text) + 2)) + f"# {comment}"
+                lines[i] = text + ending
+                if not old_val.strip():
+                    # A block list ("key:" then "- item" lines) is replaced as a whole.
+                    item = re.compile(rf"^{indent}\s+-(\s|$)")
+                    while i + 1 < len(lines) and item.match(lines[i + 1]):
+                        del lines[i + 1]
                 done = True
                 break
     if not done:
+        tail = f"  # {comment}" if comment else ""
         if section_at is not None:
-            lines.insert(section_at + 1, f"  {key}: {new_val}{newline}")
+            lines.insert(section_at + 1, f"  {key}: {new_val}{tail}{newline}")
         else:
             if lines and not lines[-1].endswith("\n"):
                 lines.append(newline)
-            lines.append(f"{newline}{section}:{newline}  {key}: {new_val}{newline}")
+            lines.append(f"{newline}{section}:{newline}  {key}: {new_val}{tail}{newline}")
     path.write_text("".join(lines), encoding="utf-8", newline="")
     try:
         load_config(path)
     except ConfigError:
         path.write_text(original, encoding="utf-8", newline="")
         raise
+
+
+# Shipped defaults that a later version changed, in groups of settings that
+# belong together: (section, {key: (old, new, comment)}). A group is moved to
+# the new defaults only if every key of it in config.yaml still holds its old
+# default, so anything the user chose is kept.
+CHANGED_DEFAULTS = [
+    # 1.2: tight stops lost to spread and noise on real XAUUSD history.
+    ("strategy", {
+        "sl_atr_mult": (1.5, 4.0, "stop loss = 4 x ATR(14) on M5"),
+        "tp_atr_mult": (2.25, 6.0, "take profit = 6 x ATR (1.5R)"),
+        "horizon_bars": (36, 144, "close after 12 hours if neither level is hit"),
+    }),
+    ("strategy", {"candidate_geometries": ([[2.5, 3.75, 72], [4.0, 6.0, 144]], [], "")}),
+    # 1.2: the daily trend needs 30+ days of M5 history.
+    ("schedule", {"history_bars": (6000, 20000, "~70 days, so the daily trend is known")}),
+    # 1.2: longer held-out tests (~7 weeks) with a less strict significance gate.
+    ("learning", {"train_bars": (40000, 60000, "~7 months of M5 history per training run")}),
+    ("learning", {"min_t_stat": (2.0, 1.5, "")}),
+]
+
+
+def _same_value(a: Any, b: Any) -> bool:
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
+    return a == b
+
+
+def migrate_changed_defaults(path: str | Path) -> list[str]:
+    """Move settings still at an old shipped default to the new default.
+
+    Returns a description of each change (empty if nothing changed).
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    with open(path, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    changes = []
+    for section, group in CHANGED_DEFAULTS:
+        values = data.get(section)
+        if not isinstance(values, dict):
+            continue
+        present = [k for k in group if k in values]
+        if not present or not all(_same_value(values[k], group[k][0]) for k in present):
+            continue
+        for key in present:
+            old, new, comment = group[key]
+            set_config_value(path, section, key, new, comment)
+            changes.append(f"{section}.{key} {_yaml_scalar(old)} -> {_yaml_scalar(new)}")
+    return changes
 
 
 def load_config(path: str | Path | None = None) -> BotConfig:

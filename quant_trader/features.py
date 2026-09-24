@@ -3,7 +3,7 @@
 Every feature is scale-free (normalised by ATR or bounded) so the model keeps
 working as the gold price moves from $2,000 to $4,000+, and every feature is
 causal: the value on a bar uses only that bar and earlier ones. Higher
-timeframe (H1/H4) features are only used once their candle has fully closed.
+timeframe (H1/H4/D1) features are only used once their candle has fully closed.
 """
 
 from __future__ import annotations
@@ -13,9 +13,17 @@ import pandas as pd
 
 from .indicators import adx, atr, ema, macd, rsi, stochastic
 
-FEATURE_VERSION = 1
+FEATURE_VERSION = 2
 # M5 bars needed before all indicators (incl. H4 EMA20) have converged.
 WARMUP_BARS = 3000
+
+# Daily trend: fast vs slow EMA of completed daily closes. It needs
+# TREND_SLOW_DAYS days of history before it is known.
+TREND_COLUMN = "d1_trend"
+TREND_FAST_DAYS = 10
+TREND_SLOW_DAYS = 30
+# M5 history the live bot loads so the daily trend is known and settled.
+LIVE_HISTORY_BARS = 20_000
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close")
 
@@ -65,6 +73,18 @@ def _htf_features(bars: pd.DataFrame, minutes: int, prefix: str, base_minutes: i
     # opening at T + minutes - base_minutes has closed.
     f.index = f.index + pd.Timedelta(minutes=minutes - base_minutes)
     return f.reindex(bars.index, method="ffill")
+
+
+def daily_trend(bars: pd.DataFrame, base_minutes: int = 5) -> pd.Series:
+    """+1 in a daily uptrend, -1 in a downtrend, NaN while not yet known.
+
+    Uses completed server-time days only: a day's close counts from the
+    close of that day's last M5 bar.
+    """
+    closes = bars["close"].resample("1D").last().dropna()
+    trend = np.sign(ema(closes, TREND_FAST_DAYS) - ema(closes, TREND_SLOW_DAYS))
+    trend.index = trend.index + pd.Timedelta(minutes=1440 - base_minutes)
+    return trend.reindex(bars.index, method="ffill")
 
 
 def build_features(bars: pd.DataFrame, point: float, atr_period: int = 14, base_minutes: int = 5) -> pd.DataFrame:
@@ -141,4 +161,5 @@ def build_features(bars: pd.DataFrame, point: float, atr_period: int = 14, base_
     out = pd.DataFrame(f, index=idx)
     out = out.join(_htf_features(bars, 60, "h1", base_minutes, (20, 50)))
     out = out.join(_htf_features(bars, 240, "h4", base_minutes, (20,)))
+    out[TREND_COLUMN] = daily_trend(bars, base_minutes)
     return out.replace([np.inf, -np.inf], np.nan).astype(float)

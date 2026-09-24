@@ -13,6 +13,7 @@ come back through a queue that the UI polls.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -190,10 +191,10 @@ class App:
         self.tk, self.ttk = tk, ttk
         self.root = root
         self.home = home
-        from .paths import upgrade_untouched_config
+        from .paths import upgrade_config
 
         first_run = not (home / "config.yaml").exists()
-        upgraded = upgrade_untouched_config(home)
+        upgraded = upgrade_config(home)
         self.config_path = ensure_config(home)
         self.events: queue.Queue = queue.Queue()
         self.log_queue: queue.Queue = queue.Queue()
@@ -218,8 +219,8 @@ class App:
         self._configure_logging()
         log.info("%s ready. Files are kept in %s", APP_NAME, self.home)
         if upgraded:
-            log.info("config.yaml updated to the new defaults (1%% risk per trade, smarter validation). "
-                     "Your previous file is saved as config.old.yaml.")
+            log.info("config.yaml updated to the new defaults (%s). Your previous file is saved as config.old.yaml.",
+                     "; ".join(upgraded))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(self.POLL_MS, self._poll)
         self.root.after(50, self._refresh)
@@ -321,7 +322,7 @@ class App:
         grid = ttk.Frame(root, padding=(10, 4, 10, 4))
         grid.pack(fill="x")
         sections = [
-            ("Bot", ["State", "Last scan", "Decision", "Next scan", "News"]),
+            ("Bot", ["State", "Last scan", "Decision", "Next scan", "News", "Daily trend"]),
             ("Account", ["Account", "Balance", "Equity", "Open P/L"]),
             ("Model", ["Trained", "Status", "Stop / target", "Thresholds", "Validation"]),
             ("Risk", ["Per trade", "Trades today", "Daily limit", "Kill switch"]),
@@ -658,15 +659,19 @@ class App:
                 messagebox.showinfo("Training finished", f"The model found an edge and will trade.\n\n{model.summary()}")
             else:
                 reasons = "\n".join(f"- {n}" for n in model.notes) or "- see log"
+                cands = model.metrics.get("candidates", [])
                 tried = "\n".join(
-                    f"- {c['geometry']}: {c['tune_trades']} trades, {c['tune_expectancy_r']:+.2f}R per trade"
-                    for c in model.metrics.get("candidates", [])
+                    f"- {c['geometry']}: "
+                    + (f"{c['tune_trades']} trades, {c['tune_expectancy_r']:+.2f}R per trade" if c["tune_trades"]
+                       else "no setting with a positive edge")
+                    for c in cands
                 )
+                heading = "Stop sizes tried (on the tune data)" if len(cands) > 1 else "On the tune data"
                 messagebox.showinfo(
                     "Training finished",
                     "No reliable edge in recent data, so the bot will stay flat (no trades) "
                     "and retry every 6 hours. This protects your account; it is not an error.\n\n"
-                    f"Why:\n{reasons}" + (f"\n\nStop sizes tried (on the tune data):\n{tried}" if tried else ""),
+                    f"Why:\n{reasons}" + (f"\n\n{heading}:\n{tried}" if tried else ""),
                 )
         elif job == "backtest":
             res, out_dir, source = payload
@@ -756,6 +761,7 @@ class App:
         else:
             self._set("Bot", "Next scan", "-")
         self._show_news(snap.get("news") if running else None)
+        self._show_trend(report.get("trend") if running else None, cfg)
 
         acc = snap.get("account") if snap else None  # last known values stay visible after stopping
         if acc:
@@ -819,6 +825,17 @@ class App:
             self._set("Bot", "News", f"next: {n['next']}")
         else:
             self._set("Bot", "News", "no high-impact news left this week")
+
+    def _show_trend(self, trend: float | None, cfg) -> None:
+        on = cfg is None or cfg.strategy.trend_filter
+        if trend is None:
+            self._set("Bot", "Daily trend", "-" if on else "filter off")
+        elif not math.isfinite(trend):
+            self._set("Bot", "Daily trend", "not known yet (needs 30+ days of history)", AMBER if on else None)
+        else:
+            word = "up" if trend > 0 else "down" if trend < 0 else "flat"
+            allowed = {"up": "buys only", "down": "sells only", "flat": "no trades"}[word]
+            self._set("Bot", "Daily trend", f"{word} ({allowed})" if on else f"{word} (filter off)")
 
     def _show_model(self, m: dict) -> None:
         if not m or not m.get("model"):

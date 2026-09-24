@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from quant_trader.config import BotConfig, ConfigError, load_config
+from quant_trader.config import Geometry, BotConfig, ConfigError, load_config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -88,11 +88,61 @@ def test_untouched_old_config_is_upgraded_edited_one_is_not(tmp_path):
     assert load_config(edited / "config.yaml").risk.risk_per_trade_pct == 0.4
 
 
+def test_untouched_1_1_config_gets_the_new_strategy_defaults(tmp_path):
+    from quant_trader.paths import upgrade_config
+
+    old_text = (ROOT / "tests" / "data" / "config_v1.1.example.yaml").read_text(encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(old_text, encoding="utf-8")
+    assert upgrade_config(tmp_path)
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.strategy.geometries() == [Geometry(4.0, 6.0, 144)]
+    assert cfg.strategy.trend_filter
+    assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == (ROOT / "config.example.yaml").read_text(encoding="utf-8")
+    assert not upgrade_config(tmp_path)
+
+
+def test_edited_config_keeps_user_choices_but_drops_old_defaults(tmp_path):
+    from quant_trader.paths import upgrade_config
+
+    old_text = (ROOT / "tests" / "data" / "config_v1.1.example.yaml").read_text(encoding="utf-8")
+    edited = old_text.replace("risk_per_trade_pct: 1.0 ", "risk_per_trade_pct: 0.7 ").replace("\n", "\r\n")
+    path = tmp_path / "config.yaml"
+    path.write_text(edited, encoding="utf-8", newline="")
+    changes = upgrade_config(tmp_path)
+    assert any("sl_atr_mult" in c for c in changes) and any("candidate_geometries" in c for c in changes)
+    cfg = load_config(path)
+    assert cfg.risk.risk_per_trade_pct == 0.7  # the user's own setting stays
+    assert cfg.strategy.geometries() == [Geometry(4.0, 6.0, 144)]
+    assert cfg.schedule.history_bars == 20000
+    assert cfg.learning.train_bars == 60000 and cfg.learning.min_t_stat == 1.5
+    raw = path.read_bytes()
+    assert b"\r\n" in raw and raw.count(b"\n") == raw.count(b"\r\n")  # Windows line endings kept
+    assert b"1.5 x ATR" not in raw  # no stale comments
+    assert (tmp_path / "config.old.yaml").read_bytes() == edited.encode("utf-8")
+    assert not upgrade_config(tmp_path)  # nothing left to do
+
+    # A stop/target/holding time the user picked is left alone as a whole.
+    path.write_text("strategy:\n  sl_atr_mult: 2.0\n  tp_atr_mult: 3.0\n  horizon_bars: 36\n", encoding="utf-8")
+    assert upgrade_config(tmp_path) == []
+    assert load_config(path).strategy.base_geometry == Geometry(2.0, 3.0, 36)
+
+
+def test_upgrade_leaves_a_broken_config_alone(tmp_path):
+    from quant_trader.paths import upgrade_config
+
+    path = tmp_path / "config.yaml"
+    broken = "strategy:\n  sl_atr_mult: 1.5\n  horizon_bars: [36\n"
+    path.write_text(broken, encoding="utf-8")
+    assert upgrade_config(tmp_path) == []
+    assert path.read_text(encoding="utf-8") == broken
+    assert not (tmp_path / "config.old.yaml").exists()
+
+
 def test_candidate_geometry_validation(tmp_path):
     p = tmp_path / "c.yaml"
     p.write_text("strategy:\n  candidate_geometries:\n    - [2.0, 3.0, 0]\n")
     with pytest.raises(ConfigError, match="candidate_geometries"):
         load_config(p)
-    p.write_text("strategy:\n  candidate_geometries:\n    - [1.5, 2.25, 36]\n    - [3, 4.5, 96]\n")
+    p.write_text("strategy:\n  candidate_geometries:\n    - [4.0, 6.0, 144]\n    - [3, 4.5, 96]\n")
     cfg = load_config(p)
-    assert [g.horizon_bars for g in cfg.strategy.geometries()] == [36, 96]  # duplicate of base dropped
+    assert [g.horizon_bars for g in cfg.strategy.geometries()] == [144, 96]  # duplicate of base dropped

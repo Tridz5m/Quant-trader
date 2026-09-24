@@ -12,6 +12,7 @@ from pathlib import Path
 # A config.yaml identical to one of these was never edited by the user.
 SHIPPED_DEFAULT_CONFIGS = {
     "96f556226938c37452302337dae696057b5a2b67cdd2982cb2aa21a4033bfef9",  # 1.0: 0.5% risk per trade
+    "9e28b066e16c9b34074a10d2ed594dd133db770f5dc07018353105e5c2c35a84",  # 1.1: 1.5/2.5/4 x ATR stops
 }
 
 
@@ -86,3 +87,33 @@ def upgrade_untouched_config(home: Path) -> bool:
     shutil.copyfile(path, home / "config.old.yaml")
     shutil.copyfile(example, path)
     return True
+
+
+def upgrade_config(home: Path) -> list[str]:
+    """Bring config.yaml up to date with the current defaults.
+
+    A never-edited file is replaced by the new example. In an edited file,
+    only settings still at an old default are updated (see
+    ``config.CHANGED_DEFAULTS``); everything the user chose is kept. The
+    previous file is saved as config.old.yaml. Returns what changed.
+    """
+    from .config import migrate_changed_defaults
+
+    path = home / "config.yaml"
+    try:
+        if upgrade_untouched_config(home):
+            return ["all settings (the file had never been edited)"]
+        if not path.exists():
+            return []
+        backup = path.read_bytes()
+    except OSError:
+        return []
+    try:
+        changes = migrate_changed_defaults(path)
+    except Exception:
+        # A broken or unusual file is left exactly as it was; loading it reports the problem.
+        path.write_bytes(backup)
+        return []
+    if changes:
+        (home / "config.old.yaml").write_bytes(backup)
+    return changes

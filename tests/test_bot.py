@@ -6,9 +6,10 @@ import pytest
 
 from quant_trader.bot import SafetyError, TradingBot
 from quant_trader.broker.sim import SimBroker
-from quant_trader.features import compute_atr
+from quant_trader.features import compute_atr, daily_trend
 from quant_trader.journal import Journal
 from quant_trader.learner import SelfLearner
+from quant_trader.model import trend_filter_probs
 
 
 class StubModel:
@@ -20,8 +21,9 @@ class StubModel:
     thr_long = thr_short = 0.6
     metrics: dict = {}
 
-    def __init__(self, p_long=0.9, p_short=0.1):
+    def __init__(self, p_long=0.9, p_short=0.1, trend_filter=False):
         self.p = (p_long, p_short)
+        self.trend_filter = trend_filter
 
     def age_hours(self):
         return 0.0
@@ -35,6 +37,10 @@ class StubModel:
     def predict(self, features):
         n = len(features)
         return np.full(n, self.p[0]), np.full(n, self.p[1])
+
+    def signals(self, features):
+        pl, ps = self.predict(features)
+        return trend_filter_probs(pl, ps, features, self.trend_filter)
 
 
 def _start_index(bars, hour=11):
@@ -70,6 +76,33 @@ def test_opens_long_with_correct_risk_and_stops(cfg, noise_bars):
     assert risk_money <= 10_000 * cfg.risk.risk_per_trade_pct / 100 + 1e-6
     rec = journal.get_trade(pos.ticket)
     assert rec["status"] == "open" and rec["bar_time"] and rec["features"]
+
+
+def test_only_trades_with_the_daily_trend(cfg, noise_bars):
+    idx = noise_bars.index
+    # A bar late enough for the 30-day trend to be known.
+    start = int(np.flatnonzero((idx.dayofweek == 2) & (idx.hour == 11) & (np.arange(len(idx)) > 9500))[0])
+    trend = daily_trend(noise_bars).iloc[start]
+    assert trend in (1.0, -1.0)
+    against = StubModel(0.1, 0.9, trend_filter=True) if trend > 0 else StubModel(0.9, 0.1, trend_filter=True)
+    bot, broker, journal = make_bot(cfg, noise_bars, against, start=start)
+    report = bot.run_cycle()
+    assert report["action"] == "none" and report["reason"] == "signal against the daily trend", report
+    assert report["trend"] == trend
+    assert not broker.positions()
+
+    along = StubModel(0.9, 0.1, trend_filter=True) if trend > 0 else StubModel(0.1, 0.9, trend_filter=True)
+    bot, broker, journal = make_bot(cfg, noise_bars, along, start=start)
+    report = bot.run_cycle()
+    assert report["action"] == "open", report
+    assert broker.positions()[0].direction == trend
+
+
+def test_waits_for_the_daily_trend_to_be_known(cfg, noise_bars):
+    # About 23 days of history: the 30-day trend is not known yet.
+    bot, broker, journal = make_bot(cfg, noise_bars, StubModel(trend_filter=True))
+    report = bot.run_cycle()
+    assert report["action"] == "none" and "daily trend not known yet" in report["reason"], report
 
 
 def test_trade_lifecycle_is_journaled_and_one_position_max(cfg, noise_bars):
@@ -162,25 +195,27 @@ def test_learner_trains_and_bot_uses_model(cfg, trend_bars):
 
 
 def test_live_feedback_overrides_labels(cfg, trend_bars):
-    from quant_trader.learner import apply_live_feedback, build_dataset
+    from quant_trader.learner import LEGACY_GEOMETRY, apply_live_feedback, build_dataset
 
+    cfg.strategy.candidate_geometries = [[1.5, 2.25, 36]]
     _, labels = build_dataset(trend_bars, cfg, 0.01)
-    base, wide = cfg.strategy.geometries()[:2]
+    base, legacy = cfg.strategy.geometries()
+    assert legacy == LEGACY_GEOMETRY
     t1, t2 = labels[base].index[100], labels[base].index[200]
     trades = [
-        # A trade from an older journal (no geometry columns) used the base geometry.
+        # A trade from a journal older than 1.1 (no geometry columns) used the 1.0 geometry.
         {"bar_time": str(t1), "direction": 1, "r_multiple": -0.8},
-        {"bar_time": str(t2), "direction": -1, "r_multiple": 1.2, "sl_atr_mult": wide.sl_atr_mult,
-         "tp_atr_mult": wide.tp_atr_mult, "horizon_bars": wide.horizon_bars},
+        {"bar_time": str(t2), "direction": -1, "r_multiple": 1.2, "sl_atr_mult": base.sl_atr_mult,
+         "tp_atr_mult": base.tp_atr_mult, "horizon_bars": base.horizon_bars},
     ]
-    new, w = apply_live_feedback(labels, trades, 3.0, cfg)
-    assert new[base].loc[t1, "long_r"] == -0.8 and new[base].loc[t1, "long_win"] == 0.0
-    assert new[wide].loc[t2, "short_r"] == 1.2 and new[wide].loc[t2, "short_win"] == 1.0
+    new, w = apply_live_feedback(labels, trades, 3.0)
+    assert new[legacy].loc[t1, "long_r"] == -0.8 and new[legacy].loc[t1, "long_win"] == 0.0
+    assert new[base].loc[t2, "short_r"] == 1.2 and new[base].loc[t2, "short_win"] == 1.0
     # Each outcome only rewrites the geometry it was traded with.
-    assert new[wide].loc[t1, "long_r"] == labels[wide].loc[t1, "long_r"]
-    assert new[base].loc[t2, "short_r"] == labels[base].loc[t2, "short_r"]
+    assert new[base].loc[t1, "long_r"] == labels[base].loc[t1, "long_r"]
+    assert new[legacy].loc[t2, "short_r"] == labels[legacy].loc[t2, "short_r"]
     assert w[100] == 3.0 and w[200] == 3.0 and w.sum() == len(w) + 4.0
-    assert labels[base].loc[t1, "long_r"] != -0.8  # original frames untouched
+    assert labels[legacy].loc[t1, "long_r"] != -0.8  # original frames untouched
 
 
 def test_snapshot_published_for_the_app(cfg, noise_bars):

@@ -4,8 +4,10 @@ What makes the bot "learn" on its own:
 
 1. It retrains on a rolling window of recent market data on a schedule, so
    it keeps adapting to the current gold regime.
-2. It tries several stop/target/holding-time geometries and keeps the one
-   that works best on recent unseen data.
+2. Thresholds and quality gates are measured on the trades it would really
+   take (only in the direction of the daily trend) and, if several
+   stop/target/holding-time geometries are configured, it keeps the one that
+   works best on recent unseen data.
 3. Every trade it actually took is fed back into training: the simulated
    label for that bar is replaced by the real outcome (real fill, spread,
    slippage and management) and weighted more heavily.
@@ -45,15 +47,19 @@ def build_dataset(bars: pd.DataFrame, cfg: BotConfig, point: float) -> tuple[pd.
     return feats.iloc[WARMUP_BARS:], labels
 
 
-def trade_geometry(trade: dict, cfg: BotConfig) -> Geometry:
-    """Geometry a journaled trade was opened with (older trades used the base one)."""
+# Trades journaled before version 1.1 carry no geometry; they all used this one.
+LEGACY_GEOMETRY = Geometry(1.5, 2.25, 36)
+
+
+def trade_geometry(trade: dict) -> Geometry:
+    """Geometry a journaled trade was opened with."""
     if trade.get("sl_atr_mult") and trade.get("tp_atr_mult") and trade.get("horizon_bars"):
         return Geometry(float(trade["sl_atr_mult"]), float(trade["tp_atr_mult"]), int(trade["horizon_bars"]))
-    return cfg.strategy.base_geometry
+    return LEGACY_GEOMETRY
 
 
 def apply_live_feedback(
-    labels: dict[Geometry, pd.DataFrame], trades: list[dict], weight: float, cfg: BotConfig
+    labels: dict[Geometry, pd.DataFrame], trades: list[dict], weight: float
 ) -> tuple[dict[Geometry, pd.DataFrame], np.ndarray]:
     """Overwrite simulated labels with the outcome of trades really taken.
 
@@ -71,7 +77,7 @@ def apply_live_feedback(
         i = pos.get(pd.Timestamp(t["bar_time"]))
         if i is None:
             continue
-        L = labels.get(trade_geometry(t, cfg))
+        L = labels.get(trade_geometry(t))
         if L is not None:
             side = "long" if t["direction"] > 0 else "short"
             r = float(t["r_multiple"])
@@ -148,7 +154,7 @@ class SelfLearner:
         if len(feats) > lc.train_bars:
             feats = feats.iloc[-lc.train_bars :]
             labels = {g: L.iloc[-lc.train_bars :] for g, L in labels.items()}
-        labels, weights = apply_live_feedback(labels, self.journal.closed_trades(), lc.live_trade_weight, self.cfg)
+        labels, weights = apply_live_feedback(labels, self.journal.closed_trades(), lc.live_trade_weight)
         try:
             challenger = train_model(feats, labels, self.cfg.strategy, lc, sample_weight=weights)
         except InsufficientDataError as exc:
