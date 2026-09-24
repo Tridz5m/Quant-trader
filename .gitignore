@@ -13,3 +13,6 @@ data/
 logs/
 models/
 backtest_results/
+
+# Build output
+selftest.log

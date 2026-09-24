@@ -23,6 +23,9 @@ dev = ["pytest>=7"]
 [project.scripts]
 quant-trader = "quant_trader.cli:main"
 
+[project.gui-scripts]
+quant-trader-app = "quant_trader.app:main"
+
 [tool.setuptools.packages.find]
 include = ["quant_trader*"]
 

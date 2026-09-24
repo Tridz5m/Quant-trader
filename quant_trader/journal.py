@@ -77,8 +77,11 @@ class Journal:
         self.path = Path(path)
         if str(path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path))
+        self.conn = sqlite3.connect(str(path), timeout=10)
         self.conn.row_factory = sqlite3.Row
+        if str(path) != ":memory:":
+            # Lets the desktop app read while the bot writes.
+            self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 

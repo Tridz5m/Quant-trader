@@ -1,0 +1,70 @@
+name: Windows app
+
+# Builds QuantTrader.exe on Windows, runs the test-suite and the exe's own
+# self-test, and uploads the exe. Pushing a tag like v1.0.0 also attaches the
+# exe to a GitHub Release.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt pyinstaller
+
+      - name: Run tests
+        run: python -m pytest -q -rs
+
+      - name: Build QuantTrader.exe
+        run: python -m PyInstaller --noconfirm --clean packaging/QuantTrader.spec
+
+      - name: Self-test the built exe
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\QuantTrader.exe -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content dist\selftest.log
+          if ($p.ExitCode -ne 0) { throw "QuantTrader.exe self-test failed (exit code $($p.ExitCode))" }
+          Remove-Item dist\selftest.log
+          "{0:N0} MB" -f ((Get-Item dist\QuantTrader.exe).Length / 1MB)
+
+      - name: Upload QuantTrader.exe
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/QuantTrader.exe
+          archive: false
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release (v* tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) { gh release create $tag --title "Quant Trader $tag" --generate-notes }
+          gh release upload $tag dist/QuantTrader.exe --clobber

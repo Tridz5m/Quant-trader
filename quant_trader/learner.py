@@ -165,15 +165,20 @@ class SelfLearner:
             f.unlink(missing_ok=True)
 
     def status(self) -> dict:
-        m = self.champion
-        if m is None:
-            return {"model": None}
-        return {
-            "model": m.version,
-            "tradeable": m.tradeable,
-            "suspended": m.suspended,
-            "thr_long": m.thr_long,
-            "thr_short": m.thr_short,
-            "age_hours": round(m.age_hours(), 1),
-            "validation": {k: m.metrics.get(k) for k in ("trades", "expectancy_r", "profit_factor", "win_rate")},
-        }
+        return describe_model(self.champion)
+
+
+def describe_model(m) -> dict:
+    """Plain-dict summary of a model for status displays."""
+    if m is None:
+        return {"model": None}
+    return {
+        "model": m.version,
+        "tradeable": m.tradeable,
+        "suspended": m.suspended,
+        "thr_long": m.thr_long,
+        "thr_short": m.thr_short,
+        "age_hours": round(m.age_hours(), 1),
+        "validation": {k: m.metrics.get(k) for k in ("trades", "expectancy_r", "profit_factor", "win_rate")},
+        "notes": list(getattr(m, "notes", []) or []),
+    }

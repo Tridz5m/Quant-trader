@@ -7,6 +7,7 @@
     python -m quant_trader download     # save MT5 XAUUSD M5 history to CSV
     python -m quant_trader backtest     # walk-forward backtest (CSV, MT5 or synthetic data)
     python -m quant_trader reset-halt   # clear the drawdown kill switch
+    python -m quant_trader app          # open the desktop app
 """
 
 from __future__ import annotations
@@ -15,12 +16,13 @@ import argparse
 import json
 import logging
 import sys
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import pandas as pd
 
+from . import services
 from .config import BotConfig, ConfigError, load_config
+from .logsetup import setup_logging
 
 log = logging.getLogger("quant_trader")
 
@@ -28,63 +30,22 @@ log = logging.getLogger("quant_trader")
 EXIT_FATAL = 2
 
 
-def setup_logging(cfg: BotConfig, name: str = "bot") -> None:
-    log_dir = cfg.path(cfg.log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
-    for h in list(root.handlers):
-        root.removeHandler(h)
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    root.addHandler(console)
-    fh = RotatingFileHandler(log_dir / f"{name}.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
-    fh.setFormatter(fmt)
-    root.addHandler(fh)
-
-
-def _mt5_broker(cfg: BotConfig):
-    from .broker.mt5_broker import MT5Broker
-
-    return MT5Broker(cfg.mt5, cfg.symbol)
-
-
 def cmd_run(cfg: BotConfig, args) -> int:
     from .bot import TradingBot
 
     if args.dry_run:
         cfg.dry_run = True
-    bot = TradingBot(cfg, _mt5_broker(cfg))
+    bot = TradingBot(cfg, services.mt5_broker(cfg))
     if args.once:
-        bot.start()
-        try:
-            bot.maybe_retrain()
-            report = bot.run_cycle()
-            print(json.dumps(report, default=str, indent=2))
-        finally:
-            bot.broker.shutdown()
+        print(json.dumps(bot.run_once(), default=str, indent=2))
         return 0
     bot.run_forever()
     return 0
 
 
 def cmd_train(cfg: BotConfig, args) -> int:
-    from .features import WARMUP_BARS, prepare_bars
-    from .journal import Journal
-    from .learner import SelfLearner
-
-    broker = _mt5_broker(cfg)
-    broker.connect()
-    try:
-        spec = broker.symbol_spec()
-        n = cfg.learning.train_bars + WARMUP_BARS + cfg.strategy.horizon_bars + 100
-        bars = prepare_bars(broker.rates(n), cfg.symbol.default_spread / spec.point)
-        learner = SelfLearner(cfg, Journal(cfg.db_path))
-        model = learner.retrain(bars, spec.point, "manual")
-        print(model.summary() if model else "No model could be trained (see log).")
-    finally:
-        broker.shutdown()
+    model = services.train_from_mt5(cfg)
+    print(model.summary() if model else "No model could be trained (see log).")
     return 0
 
 
@@ -104,7 +65,7 @@ def cmd_status(cfg: BotConfig, args) -> int:
         if rs:
             print(f"\nLast {len(rs)} trades: expectancy {sum(rs) / len(rs):+.2f}R, win rate {sum(r > 0 for r in rs) / len(rs):.0%}")
     if not args.offline:
-        broker = _mt5_broker(cfg)
+        broker = services.mt5_broker(cfg)
         broker.connect()
         try:
             acc = broker.account()
@@ -118,7 +79,7 @@ def cmd_status(cfg: BotConfig, args) -> int:
 
 
 def cmd_download(cfg: BotConfig, args) -> int:
-    broker = _mt5_broker(cfg)
+    broker = services.mt5_broker(cfg)
     broker.connect()
     try:
         bars = broker.rates(args.bars)
@@ -131,91 +92,41 @@ def cmd_download(cfg: BotConfig, args) -> int:
     return 0
 
 
-def load_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    cols = {c.lower().strip("<>"): c for c in df.columns}
-    if "time" in cols:
-        idx = pd.to_datetime(df[cols["time"]])
-    elif "date" in cols and "time" not in cols:
-        idx = pd.to_datetime(df[cols["date"]])
-    else:
-        raise ValueError("CSV needs a 'time' column")
-    rename = {cols[k]: k for k in ("open", "high", "low", "close", "tick_volume", "spread") if k in cols}
-    if "tickvol" in cols:
-        rename[cols["tickvol"]] = "tick_volume"
-    out = df.rename(columns=rename)
-    out.index = pd.DatetimeIndex(idx, name="time")
-    keep = [c for c in ("open", "high", "low", "close", "tick_volume", "spread") if c in out.columns]
-    return out[keep]
-
-
 def cmd_backtest(cfg: BotConfig, args) -> int:
-    from .backtest import format_stats, run_backtest
-    from .broker.base import default_gold_spec
-    from .features import prepare_bars
+    from .backtest import format_stats
     from .model import InsufficientDataError
 
-    spec = default_gold_spec()
-    if args.csv:
-        raw = load_csv(args.csv)
-    elif args.synthetic:
-        from .synthetic import synthetic_gold_bars
-
-        raw = synthetic_gold_bars(args.bars or 40_000, seed=args.seed)
+    source = "csv" if args.csv else "synthetic" if args.synthetic else "mt5"
+    try:
+        bars, spec = services.load_backtest_bars(cfg, source, args.csv, args.bars, args.seed)
+    except (OSError, ValueError) as exc:
+        print(f"Could not load the data: {exc}", file=sys.stderr)
+        return 1
+    if source == "synthetic":
         print("WARNING: synthetic data - this only demonstrates the pipeline, not real performance.")
-    else:
-        broker = _mt5_broker(cfg)
-        broker.connect()
-        try:
-            spec = broker.symbol_spec()
-            raw = broker.rates(args.bars or 100_000)
-        finally:
-            broker.shutdown()
-    if args.bars:
-        raw = raw.iloc[-args.bars:]
-    bars = prepare_bars(raw, cfg.symbol.default_spread / spec.point)
     print(f"Backtesting {len(bars)} bars {bars.index[0]} -> {bars.index[-1]} "
           f"(retrain every {args.retrain_days} days)...")
     try:
-        res = run_backtest(
-            bars, cfg, spec,
-            retrain_every_bars=int(args.retrain_days * 276),
-            start_equity=args.equity,
-            commission_per_lot=args.commission,
-        )
+        res = services.backtest(cfg, bars, spec, args.retrain_days, args.equity, args.commission)
     except InsufficientDataError as exc:
-        print(
-            f"\nNot enough history for a walk-forward backtest: {exc}.\n"
-            "In MT5 set Tools > Options > Charts > Max bars in chart to Unlimited, open an XAUUSD M5 chart\n"
-            "and hold the Home key until no more history loads, then run the backtest again.",
-            file=sys.stderr,
-        )
+        print(f"\nNot enough history for a walk-forward backtest: {exc}.\n{services.MORE_HISTORY_HELP}", file=sys.stderr)
         return 1
     print(format_stats(res.stats))
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    res.trades.round({"entry": 3, "exit": 3, "sl_initial": 3, "tp": 3, "profit": 2, "r_multiple": 3, "p": 3}).to_csv(
-        out / "trades.csv", index=False
-    )
-    res.equity.to_csv(out / "equity.csv")
-    pd.DataFrame(res.models).to_csv(out / "models.csv", index=False)
+    out = services.save_backtest(res, Path(args.out))
     print(f"\nTrades, equity curve and model history written to {out}/")
     return 0
 
 
 def cmd_reset_halt(cfg: BotConfig, args) -> int:
-    from .journal import Journal
-    from .risk import RiskState
-
-    journal = Journal(cfg.db_path)
-    state = RiskState.from_dict(journal.get_state("risk_state"))
-    state.halted = False
-    state.halt_reason = ""
-    state.peak_equity = 0.0  # re-anchor the drawdown to current equity
-    state.cooldown_until = ""
-    journal.set_state("risk_state", state.to_dict())
+    services.reset_halt(cfg)
     print("Kill switch cleared. Drawdown will be measured from current equity.")
     return 0
+
+
+def cmd_app(cfg: BotConfig, args) -> int:
+    from .app import main as app_main
+
+    return app_main([])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -248,14 +159,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", default="backtest_results")
 
     sub.add_parser("reset-halt", help="clear the max-drawdown kill switch")
+    sub.add_parser("app", help="open the desktop app")
 
     args = parser.parse_args(argv)
+    if args.cmd == "app":
+        return cmd_app(None, args)
     try:
         cfg = load_config(args.config)
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         return EXIT_FATAL
-    setup_logging(cfg, args.cmd)
+    setup_logging(cfg, "bot" if args.cmd == "run" else args.cmd)
     handlers = {
         "run": cmd_run,
         "train": cmd_train,

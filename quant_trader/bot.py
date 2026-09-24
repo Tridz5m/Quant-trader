@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import asdict
 from typing import Callable
 
 import pandas as pd
@@ -12,6 +13,7 @@ import pandas as pd
 from .broker.base import LONG, Broker, BrokerError, Position, SymbolSpec, Tick
 from .config import BotConfig
 from .features import WARMUP_BARS, build_features, compute_atr, prepare_bars
+from .instance import InstanceLock
 from .journal import Journal
 from .learner import SelfLearner
 from .policy import decide, entry_block_reason, manage_position
@@ -47,6 +49,9 @@ class TradingBot:
         self._stop = False
         self._last_tick_time: pd.Timestamp | None = None
         self._tick_changed_at = 0.0
+        # Read by the desktop app from its own thread; replaced, never mutated.
+        self.snapshot: dict = {}
+        self.next_scan_at: float | None = None
 
     # --- lifecycle --------------------------------------------------------
     def start(self) -> None:
@@ -74,11 +79,35 @@ class TradingBot:
     def stop(self) -> None:
         self._stop = True
 
-    def run_forever(self) -> None:
-        self.start()
-        self.maybe_retrain()
-        log.info("Bot running: scanning %s every %ds", self.broker.symbol, self.cfg.schedule.scan_interval_seconds)
+    def _acquire_lock(self) -> InstanceLock:
+        lock = InstanceLock(self.cfg.path(self.cfg.data_dir) / "bot.lock")
+        if not lock.acquire():
+            raise SafetyError("Another Quant Trader bot is already running from this folder. Stop it first.")
+        return lock
+
+    def run_once(self) -> dict:
+        """Connect, run a single scan and disconnect."""
+        lock = self._acquire_lock()
         try:
+            self.start()
+            self.maybe_retrain()
+            return self.run_cycle()
+        finally:
+            self.broker.shutdown()
+            self.journal.close()
+            lock.release()
+
+    def run_forever(self) -> None:
+        lock = None
+        started = False
+        try:
+            lock = self._acquire_lock()
+            self.start()
+            started = True
+            if not self._stop:
+                self.maybe_retrain()
+            self.publish_snapshot({"action": "started", "reason": ""})
+            log.info("Bot running: scanning %s every %ds", self.broker.symbol, self.cfg.schedule.scan_interval_seconds)
             while not self._stop:
                 self.sleep_until_next_scan()
                 if self._stop:
@@ -93,10 +122,15 @@ class TradingBot:
                 except Exception:
                     log.exception("Unexpected error in cycle; continuing")
         except KeyboardInterrupt:
-            log.info("Stopped by user. Open positions keep their stop-loss and take-profit on the server.")
+            pass
         finally:
+            self.next_scan_at = None
             self.broker.shutdown()
             self.journal.close()
+            if lock is not None:
+                lock.release()
+            if started:
+                log.info("Bot stopped. Open positions keep their stop-loss and take-profit on the server.")
 
     def seconds_to_next_scan(self) -> float:
         interval = self.cfg.schedule.scan_interval_seconds
@@ -107,10 +141,14 @@ class TradingBot:
         return max(0.0, target - now)
 
     def sleep_until_next_scan(self) -> None:
-        self.sleep(self.seconds_to_next_scan())
+        seconds = self.seconds_to_next_scan()
+        self.next_scan_at = self.wall_clock() + seconds
+        self.sleep(seconds)
 
     def _reconnect(self) -> None:
         for attempt in range(5):
+            if self._stop:
+                return
             try:
                 self.broker.shutdown()
                 self.broker.connect()
@@ -200,6 +238,31 @@ class TradingBot:
         log.info("Scan %s |%s %s%s", report.get("bar_time"), probs, report["action"],
                  f" ({report['reason']})" if report["reason"] else "")
         self.maybe_retrain()
+        self.publish_snapshot(report)
+
+    def publish_snapshot(self, report: dict) -> None:
+        """Status for the desktop app: account, positions, model and risk.
+
+        Purely informational, so it can never interrupt trading.
+        """
+        try:
+            try:
+                acc = self.broker.account()
+                positions = self.broker.positions()
+            except Exception:
+                acc, positions = None, []
+            self.snapshot = {
+                "updated": self.wall_clock(),
+                "symbol": self.broker.symbol,
+                "dry_run": self.cfg.dry_run,
+                "report": dict(report),
+                "account": asdict(acc) if acc is not None else None,
+                "positions": [asdict(p) for p in positions],
+                "risk": self.state.to_dict(),
+                "model": self.learner.status(),
+            }
+        except Exception:
+            log.debug("Could not build status snapshot", exc_info=True)
 
     def _look_for_entry(self, report, bars, feats, tick: Tick, atr_now, now, last_bar, spec: SymbolSpec) -> None:
         scfg = self.cfg.strategy

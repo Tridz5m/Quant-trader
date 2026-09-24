@@ -16,9 +16,15 @@ class StubModel:
 
     version = "stub"
     tradeable = True
+    suspended = False
+    thr_long = thr_short = 0.6
+    metrics: dict = {}
 
     def __init__(self, p_long=0.9, p_short=0.1):
         self.p = (p_long, p_short)
+
+    def age_hours(self):
+        return 0.0
 
     def is_compatible(self, scfg):
         return True
@@ -165,6 +171,79 @@ def test_live_feedback_overrides_labels(cfg, trend_bars):
     assert new.loc[t, "long_r"] == -0.8 and new.loc[t, "long_win"] == 0.0
     assert w[100] == 3.0 and w.sum() == len(w) + 2.0
     assert labels.loc[t, "long_r"] != -0.8  # original frame untouched
+
+
+def test_snapshot_published_for_the_app(cfg, noise_bars):
+    bot, broker, _ = make_bot(cfg, noise_bars, StubModel())
+    bot.run_cycle()
+    snap = bot.snapshot
+    assert snap["report"]["action"] == "open"
+    assert snap["account"]["balance"] == 10_000 and len(snap["positions"]) == 1
+    assert snap["model"]["model"] == "stub" and "trades_today" in snap["risk"]
+
+
+def test_run_forever_stops_promptly_and_cleans_up(cfg, noise_bars, tmp_path):
+    import threading
+
+    stop = threading.Event()
+    broker = SimBroker(noise_bars, start_index=_start_index(noise_bars), magic=cfg.symbol.magic)
+    holder = {}
+
+    def run():
+        # Like the desktop app: the bot (and its SQLite journal) lives on the worker thread.
+        journal = Journal(tmp_path / "j.sqlite")
+        learner = SelfLearner(cfg, journal)
+        learner.champion = StubModel()
+        learner.last_attempt = datetime.now(timezone.utc)
+        holder["bot"] = TradingBot(cfg, broker, journal=journal, learner=learner, sleep=stop.wait)
+        holder["bot"].run_forever()
+
+    t = threading.Thread(target=run)
+    t.start()
+    for _ in range(200):
+        if holder.get("bot") is not None and holder["bot"].snapshot:
+            break
+        stop.wait(0.05)
+    bot = holder["bot"]
+    assert bot.snapshot["report"]["action"] == "started"
+    assert bot.next_scan_at is not None
+    bot.stop()
+    stop.set()
+    t.join(timeout=10)
+    assert not t.is_alive() and not broker.connected
+
+
+def test_second_bot_on_same_folder_is_refused(cfg, noise_bars):
+    from quant_trader.bot import SafetyError
+    from quant_trader.instance import InstanceLock
+
+    lock = InstanceLock(cfg.path(cfg.data_dir) / "bot.lock")
+    assert lock.acquire()
+    try:
+        broker = SimBroker(noise_bars, magic=cfg.symbol.magic)
+        bot = TradingBot(cfg, broker, journal=Journal(":memory:"), sleep=lambda s: None)
+        with pytest.raises(SafetyError, match="already running"):
+            bot.run_forever()
+    finally:
+        lock.release()
+    assert lock.acquire()
+    lock.release()
+
+
+def test_run_once_scans_and_cleans_up(cfg, noise_bars):
+    broker = SimBroker(noise_bars, start_index=_start_index(noise_bars), magic=cfg.symbol.magic)
+    journal = Journal(":memory:")
+    learner = SelfLearner(cfg, journal)
+    learner.champion = StubModel()
+    learner.last_attempt = datetime.now(timezone.utc)
+    bot = TradingBot(cfg, broker, journal=journal, learner=learner, sleep=lambda s: None)
+    assert bot.run_once()["action"] == "open"
+    assert not broker.connected
+    from quant_trader.instance import InstanceLock
+
+    lock = InstanceLock(cfg.path(cfg.data_dir) / "bot.lock")
+    assert lock.acquire()  # released again
+    lock.release()
 
 
 def test_frozen_tick_feed_is_treated_as_market_closed(cfg, noise_bars):

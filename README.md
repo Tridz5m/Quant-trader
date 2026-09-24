@@ -6,6 +6,9 @@ manages and closes trades by itself. It trains its own machine-learning model
 from your broker's price history, keeps retraining as the market changes, and
 learns from the outcome of every trade it takes.
 
+It comes as a **Windows desktop app, `QuantTrader.exe`** (no Python needed),
+and can also be run from source.
+
 > **Risk warning.** Trading gold on leverage can lose money quickly, including
 > more than you expect during news spikes and gaps. Nothing here is financial
 > advice and no profit is guaranteed. A model that worked in the past can stop
@@ -55,14 +58,53 @@ the live bot, so the backtest measures what the live bot actually does.
 
 ---
 
-## Requirements
+## Desktop app (QuantTrader.exe)
+
+The easiest way to run the bot: one file, nothing else to install.
+
+1. **Download `QuantTrader.exe`**: on GitHub open **Actions → Windows app**,
+   click the latest green run and download **QuantTrader.exe** under
+   *Artifacts* (or from **Releases**, once a version is published).
+2. **Put it in its own folder**, e.g. `C:\QuantTrader\`. The app keeps its
+   settings (`config.yaml`), trade journal, logs and models next to the exe.
+3. **Double-click it.** Windows may show *"Windows protected your PC"*
+   because the exe isn't code-signed: click *More info → Run anyway*. The
+   first launch takes a few seconds while it unpacks.
+4. **Prepare MT5** as described under *Setup → Prepare MT5* below (demo
+   account, Algo Trading on, Max bars in chart = Unlimited).
+5. Tick **Dry run** and click **Start trading** to watch the bot's decisions
+   without placing orders; untick it to let it trade by itself.
+
+What's in the window:
+
+- **Start trading / Stop**: runs the bot, which scans on every 5-minute candle close.
+  Closing the window stops the bot; open trades keep their stop loss and take
+  profit on the broker's server.
+- **Status panels**: bot decision and probabilities, next scan countdown,
+  account balance/equity, model status (tradeable or staying flat) and risk
+  limits (trades today, daily loss limit, kill switch).
+- **Live log**, **Open positions** and **Trade history** tabs.
+- **Train now** and **Backtest...** (MT5 history, a CSV file, or synthetic
+  demo data); results are saved in `backtest_results\`.
+- **Settings** opens `config.yaml` in Notepad; changes apply the next time you
+  start, train or backtest. *Tools → Reset kill switch* clears the drawdown halt.
+
+Build the exe yourself (needs Python): double-click `build_exe.bat`. It
+installs PyInstaller, builds `dist\QuantTrader.exe` and runs the exe's
+built-in self-test.
+
+---
+
+## Running from source
+
+### Requirements
 
 - **Windows** (the official `MetaTrader5` Python package is Windows-only; a
   Windows VPS is ideal for 24/5 running)
 - **MetaTrader 5** terminal installed and logged in to your broker
 - **Python 3.10 – 3.14, 64-bit**, from python.org
 
-## Setup
+### Setup
 
 1. **Prepare MT5**
    - Log in to your (demo) account.
@@ -87,9 +129,12 @@ the live bot, so the backtest measures what the live bot actually does.
    or set the `MT5_LOGIN` / `MT5_PASSWORD` / `MT5_SERVER` environment
    variables instead of storing the password in the file.
 
-## Usage
+### Usage
 
 ```bat
+:: 0. The desktop app, from source
+py -m quant_trader app
+
 :: 1. See how the full self-learning system would have traded your broker's data
 py -m quant_trader backtest
 
@@ -156,12 +201,15 @@ and keep `risk.risk_per_trade_pct` small.
 
 ## Files it creates
 
+Next to `QuantTrader.exe` (or in the Quant-trader folder when run from source):
+
 | Path | Contents |
 |---|---|
+| `config.yaml` | Your settings (created from `config.example.yaml` on first start) |
 | `logs/bot.log` | Every scan, signal, order and training run (rotated) |
 | `data/journal.sqlite` | Trades (with the features at entry), signals, equity, model history, risk state |
 | `models/champion.joblib` | The model currently trading, plus recent history models |
-| `backtest_results/` | `trades.csv`, `equity.csv`, `models.csv` from the last backtest |
+| `backtest_results/` | `trades.csv`, `equity.csv`, `models.csv` per backtest |
 
 ## Project layout
 
@@ -177,7 +225,12 @@ quant_trader/
   backtest.py     walk-forward backtest of the whole system
   journal.py      SQLite journal
   broker/         MT5 connector + simulator
+  app.py          desktop app (Tkinter): start/stop, status, trades, log, backtests
+  services.py     train / backtest / reset operations shared by the app and the CLI
+  selftest.py     end-to-end self-test run on every freshly built exe
   cli.py          command line interface
+packaging/        PyInstaller recipe, icon and splash for QuantTrader.exe
+.github/workflows/windows-app.yml   builds, tests and uploads QuantTrader.exe
 tests/            unit and integration tests (run anywhere, no MT5 needed)
 ```
 
@@ -191,6 +244,8 @@ tests/            unit and integration tests (run anywhere, no MT5 needed)
 | `Not enough history for a walk-forward backtest` | In MT5 set *Tools → Options → Charts → Max bars in chart* to Unlimited, open an XAUUSD M5 chart and hold **Home** until no more history loads. |
 | `Algo Trading is disabled` | Click the **Algo Trading** button in the MT5 toolbar (it turns green). |
 | `NOT TRADEABLE` after training | Not an error: no statistically reliable edge was found in recent data, so the bot stays flat and retries later. |
+| *Windows protected your PC* when opening `QuantTrader.exe` | The exe isn't code-signed. Click *More info → Run anyway*. |
+| `Another Quant Trader bot is already running from this folder` | Only one bot may trade per folder. Stop the other one (app window or command prompt) first. |
 
 ## Development
 
